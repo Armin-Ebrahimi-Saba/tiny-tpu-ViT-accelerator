@@ -6,7 +6,6 @@
 //   bind loss_child loss_child_assertions u_lc_assert (.*);
 // ============================================================
 `timescale 1ns/1ps
-`default_nettype none
 
 module loss_child_assertions (
     input logic clk,

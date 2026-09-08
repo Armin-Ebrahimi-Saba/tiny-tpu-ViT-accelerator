@@ -1,5 +1,4 @@
 `timescale 1ns/1ps
-`default_nettype none
 
 module control_unit (
     input logic [129:0] instruction,  // 130 bits total (0-129)

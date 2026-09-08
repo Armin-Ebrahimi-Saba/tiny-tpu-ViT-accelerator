@@ -6,7 +6,6 @@
 //   bind systolic systolic_assertions u_sys_assert (.*);
 // ============================================================
 `timescale 1ns/1ps
-`default_nettype none
 
 module systolic_assertions #(
     parameter int SYSTOLIC_ARRAY_WIDTH = 2

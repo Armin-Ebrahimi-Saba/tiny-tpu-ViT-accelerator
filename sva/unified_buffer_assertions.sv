@@ -12,7 +12,6 @@
 // because a bind module is scoped inside the DUT instance.
 // ============================================================
 `timescale 1ns/1ps
-`default_nettype none
 
 module unified_buffer_assertions #(
     parameter int UNIFIED_BUFFER_WIDTH = 128,

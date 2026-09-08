@@ -1,5 +1,4 @@
 `timescale 1ns/1ps
-`default_nettype none
 
 module gradient_descent (
     input logic clk,
@@ -27,7 +26,6 @@ module gradient_descent (
 );
 
     logic signed [15:0] sub_value_out;
-    logic grad_descent_in_reg;
     logic signed [15:0] sub_in_a;
     logic signed [15:0] mul_out;
     logic mul_overflow, sub_overflow;

@@ -1,5 +1,4 @@
 `timescale 1ns/1ps
-`default_nettype none
 
 // 2x2 systolic array
 module systolic #(

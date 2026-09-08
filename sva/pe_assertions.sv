@@ -6,7 +6,6 @@
 //   bind pe pe_assertions u_pe_assert (.*);
 // ============================================================
 `timescale 1ns/1ps
-`default_nettype none
 
 module pe_assertions (
     input logic clk,

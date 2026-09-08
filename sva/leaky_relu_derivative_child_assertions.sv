@@ -7,7 +7,6 @@
 //     leaky_relu_derivative_child_assertions u_lrd_assert (.*);
 // ============================================================
 `timescale 1ns/1ps
-`default_nettype none
 
 module leaky_relu_derivative_child_assertions (
     input logic clk,

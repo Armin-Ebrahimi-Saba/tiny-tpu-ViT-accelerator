@@ -1,6 +1,5 @@
 
 `timescale 1ns/1ps
-`default_nettype none
 
 // child loss module for MSE backward pass (gradient computation)
 module loss_child (

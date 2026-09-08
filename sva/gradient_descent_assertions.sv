@@ -6,7 +6,6 @@
 //   bind gradient_descent gradient_descent_assertions u_gd_assert (.*);
 // ============================================================
 `timescale 1ns/1ps
-`default_nettype none
 
 module gradient_descent_assertions (
     input logic clk,

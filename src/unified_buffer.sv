@@ -1,5 +1,4 @@
 `timescale 1ns/1ps
-`default_nettype none
 
 module unified_buffer #(
     parameter int UNIFIED_BUFFER_WIDTH = 128,
@@ -128,13 +127,10 @@ module unified_buffer #(
     // BUG-UB-1 fix: within-cycle tracking variables replacing blocking assignments in always block.
     // Each _next variable is set with blocking (=) to track intermediate address within one clock
     // edge, then written to the corresponding register with a single non-blocking (<=).
-    logic [15:0]        wr_ptr_next;
-    logic [15:0]        rd_input_ptr_next;
-    logic signed [15:0] rd_weight_ptr_next;
-    logic [15:0]        rd_Y_ptr_next;
-    logic [15:0]        rd_H_ptr_next;
-    logic [15:0]        rd_grad_weight_ptr_next;
-    logic [15:0]        grad_descent_ptr_next;
+    // These are declared as automatic variables local to the always_ff block below: at module
+    // scope they were inferred as real sequential elements (Vivado "Unused sequential element
+    // <name>_reg was removed"), so the RTL and the synthesized netlist did not describe the same
+    // storage. As block-locals they are pure within-cycle temporaries, which is the intent.
 
     genvar i;
     generate
@@ -204,6 +200,16 @@ module unified_buffer #(
     end 
 
     always_ff @(posedge clk or posedge rst) begin
+        // Within-cycle address temporaries (see note above). Every one is assigned
+        // from its register before it is read, so they hold no state across cycles.
+        automatic logic [15:0]        wr_ptr_next             = '0;
+        automatic logic [15:0]        rd_input_ptr_next       = '0;
+        automatic logic signed [15:0] rd_weight_ptr_next      = '0;
+        automatic logic [15:0]        rd_Y_ptr_next           = '0;
+        automatic logic [15:0]        rd_H_ptr_next           = '0;
+        automatic logic [15:0]        rd_grad_weight_ptr_next = '0;
+        automatic logic [15:0]        grad_descent_ptr_next   = '0;
+
         if (rst) begin
             // reset all memory to 0
             for (int i = 0; i < UNIFIED_BUFFER_WIDTH; i++) begin
@@ -235,6 +241,7 @@ module unified_buffer #(
             rd_weight_col_size <= '0;
             rd_weight_time_counter <= '0;
             rd_weight_transpose <= '0;
+            rd_weight_skip_size <= '0;
 
             rd_bias_ptr <= '0;
             rd_bias_row_size <= '0;

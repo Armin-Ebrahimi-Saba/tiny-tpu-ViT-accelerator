@@ -11,7 +11,6 @@
 //   bind control_unit control_unit_assertions u_cu_assert (.*);
 // ============================================================
 `timescale 1ns/1ps
-`default_nettype none
 
 module control_unit_assertions (
     // NOTE: control_unit has no clock port (purely combinational RTL).

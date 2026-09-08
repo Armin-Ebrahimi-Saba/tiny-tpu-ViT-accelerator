@@ -1,0 +1,91 @@
+{
+  "name": "tpu-v2",
+  "description": "Extended tiny-tpu inference datapath targeted by this toolchain. The RTL in src/ does NOT implement this yet; this file is the requirements contract the RTL must satisfy, and the emulator in sw/ is the bit-exact reference it must match.",
+  "clock_mhz": 50,
+
+  "array": {
+    "rows": 16,
+    "cols": 16,
+    "dataflow": "weight_stationary",
+    "double_buffered_weights": true
+  },
+
+  "datapath": {
+    "act_bits": 8,
+    "weight_bits": 8,
+    "accum_bits": 32,
+    "bias_bits": 32,
+    "signed": true,
+    "act_min": -127,
+    "act_max": 127,
+    "wide_act_bits": 16,
+    "wide_act_max": 32767,
+    "note": "act_min is -127 not -128 so that symmetric negation never overflows and so weights and activations share one saturation rule.",
+    "wide_note": "Selected tensors are carried at int16: attention logits always, and optionally the transformer residual stream, where a ViT's outlier channels otherwise set the scale for every ordinary value. Widening costs unified-buffer entries and vector-unit width, not array width -- no wide tensor is ever fed to the systolic array, because 32767 * 127 * 576 overflows the int32 accumulator."
+  },
+
+  "requant": {
+    "form": "y = sat_int8(round_half_up(acc_int32 * multiplier_int32 / 2^shift))",
+    "multiplier_bits": 32,
+    "multiplier_range": [1073741824, 2147483647],
+    "shift_min": 0,
+    "shift_max": 62,
+    "intermediate_bits": 64,
+    "shift_note": "shift = 31 - frexp_exponent(M). A real multiplier at or above 0.5 needs a shift below 31, so the lower bound is 0, not 31.",
+    "rounding": "half_up",
+    "per_channel": true,
+    "note": "One 32x32->64 multiply and an arithmetic shift per output element. Per-channel requires a (multiplier, shift) RAM addressed by output column -- 5 bytes per column, so 16 entries for a 16-wide array. Measured to be worth it: per-tensor weight scales are the dominant int8 error source in a ViT."
+  },
+
+  "unified_buffer": {
+    "bytes": 65536,
+    "banks": 4,
+    "note": "Working window only. Weights live in DRAM and are streamed; the UB holds the active tile plus one prefetched tile."
+  },
+
+  "dram": {
+    "bytes": 536870912,
+    "burst_bytes": 64,
+    "read_bytes_per_cycle": 8,
+    "note": "Nexys Video / equivalent DDR3. 512 MB comfortably holds the 24.8 M int8 weights of DA-V2-Small."
+  },
+
+  "vector_unit": {
+    "relu": true,
+    "leaky_relu": true,
+    "gelu": {"impl": "lut", "entries": 256, "in_bits": 8, "out_bits": 8},
+    "softmax": {
+      "impl": "exp_lut_int",
+      "input_bits": 16,
+      "exp_lut_entries": 256,
+      "exp_lut_stages": 2,
+      "exp_out_bits": 16,
+      "accum_bits": 32,
+      "axis": "innermost",
+      "note": "Two cascaded 256-entry ROMs and one multiply give exp() over the full int16 logit range: exp(-s*(256*hi + lo)) = exp(-s*256*hi) * exp(-s*lo). Attention logits must arrive at int16; requantizing them to int8 makes the exponential too granular and corrupts every probability in the row."
+    },
+    "layernorm": {"impl": "integer_rsqrt", "accum_bits": 64, "rsqrt_newton_iters": 4, "affine": true},
+    "elementwise_add": true,
+    "elementwise_mul": true,
+    "bilinear_upsample": {"impl": "fixed_point", "weight_frac_bits": 8, "scales": [2, 4]}
+  },
+
+  "supported_ops": {
+    "conv2d":          {"lowering": "im2col", "max_kernel": 16, "dilation": [1], "groups": [1], "bias": true},
+    "conv_transpose2d":{"lowering": "im2col_scatter", "max_kernel": 4, "stride_equals_kernel_only": true, "bias": true},
+    "matmul":          {"lowering": "tile", "bias": true},
+    "batch_matmul":    {"lowering": "tile", "bias": false, "output_bits": [8, 16]},
+    "add":             {"output_bits": [8, 16]},
+    "mul":             {"broadcast_rank": 1},
+    "layernorm":       {"axis": -1},
+    "softmax":         {"axis": -1},
+    "gelu":            {},
+    "relu":            {},
+    "interpolate":     {"mode": "bilinear", "align_corners": true, "scales": [2, 4]},
+    "reshape":         {},
+    "transpose":       {},
+    "slice":           {},
+    "concat":          {},
+    "pad":             {"mode": "constant"}
+  }
+}

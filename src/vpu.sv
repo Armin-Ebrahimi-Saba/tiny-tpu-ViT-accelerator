@@ -1,5 +1,4 @@
 `timescale 1ns/1ps
-`default_nettype none
 
 // three data pathways:
 // (forward pass hidden layer computations) input from sys --> bias --> leaky relu --> output

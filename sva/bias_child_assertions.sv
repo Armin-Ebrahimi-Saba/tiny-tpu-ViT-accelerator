@@ -6,7 +6,6 @@
 //   bind bias_child bias_child_assertions u_bc_assert (.*);
 // ============================================================
 `timescale 1ns/1ps
-`default_nettype none
 
 module bias_child_assertions (
     input logic clk,

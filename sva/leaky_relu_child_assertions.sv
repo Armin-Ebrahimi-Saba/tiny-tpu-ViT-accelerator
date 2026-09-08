@@ -6,7 +6,6 @@
 //   bind leaky_relu_child leaky_relu_child_assertions u_lr_assert (.*);
 // ============================================================
 `timescale 1ns/1ps
-`default_nettype none
 
 module leaky_relu_child_assertions (
     input logic clk,

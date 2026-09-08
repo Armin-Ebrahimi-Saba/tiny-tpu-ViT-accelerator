@@ -1,5 +1,4 @@
 `timescale 1ns/1ps
-`default_nettype none
 
 module tpu #(
     parameter int SYSTOLIC_ARRAY_WIDTH = 2
@@ -27,7 +26,14 @@ module tpu #(
 
     input logic sys_switch_in,
     input logic [15:0] vpu_leak_factor_in,
-    input logic [15:0] inv_batch_size_times_two_in
+    input logic [15:0] inv_batch_size_times_two_in,
+
+    // VPU results, exposed so the host can read them back. Without at least one
+    // output the whole design is dead logic and synthesis optimizes it away.
+    output logic [15:0] vpu_data_out_1,
+    output logic [15:0] vpu_data_out_2,
+    output logic vpu_valid_out_1,
+    output logic vpu_valid_out_2
 );
     // UB internal output wires
     logic [15:0] ub_wr_data_in [0:SYSTOLIC_ARRAY_WIDTH-1];
@@ -63,12 +69,8 @@ module tpu #(
     logic sys_valid_out_21;
     logic sys_valid_out_22;
 
-    // VPU internal output wires
-    logic [15:0] vpu_data_out_1;
-    logic [15:0] vpu_data_out_2;
-    logic vpu_valid_out_1;
-    logic vpu_valid_out_2;
-
+    // VPU outputs are now module ports (see above); they still feed the UB
+    // writeback path exactly as before.
     assign ub_wr_data_in[0] = vpu_data_out_1;
     assign ub_wr_data_in[1] = vpu_data_out_2;
     assign ub_wr_valid_in[0] = vpu_valid_out_1;

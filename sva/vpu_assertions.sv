@@ -6,7 +6,6 @@
 //   bind vpu vpu_assertions u_vpu_assert (.*);
 // ============================================================
 `timescale 1ns/1ps
-`default_nettype none
 
 module vpu_assertions (
     input logic clk,
