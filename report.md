@@ -924,24 +924,141 @@ question worth asking rather than a fantasy.
   is written down rather than done.
 - **SYNTH-10 (75)** — wide multipliers, which is what a requantizer is.
 
-### 6.14 Remaining
+### 6.14 Step 12 — what a real block costs, and what the bottleneck actually is
+
+The block in §6.11 is T=16 tokens, E=32 channels. ViT-S/14 at 518×518 is T=1370, E=384,
+6 heads of 64, HID=1536. The question this step asks is whether the design scales to
+that, and the answer arrived in an order I did not expect.
+
+`sw/tiling.py` is the new tool. `lower.py` costs a schedule against peak MACs and DRAM
+bandwidth, but it has no model of the on-chip buffers, so it cannot say whether an op
+*fits* — which at real dimensions is the question that decides everything. The tiler
+takes the buffer capacities as they are in the RTL and, for each GEMM, picks the tiling
+with the least DRAM traffic that fits, or says why none does.
+
+#### Seven of a block's 38 GEMMs could not run at all
+
+The buffer geometry, in 128-bit words of 16 int8 lanes:
+
+```
+activations   Mt * (K / 16)     one word per (row, k tile)
+weights       K  * (Nt / 16)    one word per (k, n tile)
+results       Mt * (Nt / 16)    one word per (row, n tile)
+```
+
+The weight buffer is the asymmetric one, and I had not noticed how asymmetric. It is
+indexed by k *row*, not by k tile: it holds K words per 16 output channels, sixteen times
+the activation buffer's appetite for the same K. With 512 words that caps K at 512, and a
+ViT-S block has seven GEMMs deeper than that — `fc2` at K=1536, and the six per-head
+`P·V` at K=1370, where the "stationary operand" is the attention probability matrix.
+Nothing tiles around it: `gemm_seq` accumulates over the k tiles that are resident and
+requantizes to int8 on the way out, so a K that does not fit needs int32 partial sums
+carried between calls, which the engine cannot do.
+
+Growing the weight buffer to 3072 words (48 KB) fixes all seven, and nothing else needs
+to change — activations and results stay at 8 KB. Total 64 KB, which is exactly what
+`sw/machines/tpu_v2.json` has specified as `unified_buffer.bytes` since before any of this
+RTL existed. The contract was right and the RTL had simply never been sized against it.
+
+#### The bottleneck is the array, not the bus
+
+The number that reorders the roadmap:
+
+```
+per block: 87.1 MB of DRAM traffic, 3.87 GMAC
+12 blocks at 50 MHz:
+  DRAM     2.61 s  (8 B/cycle)
+  compute  3.62 s  (256 MAC/cycle)
+  -> compute-bound at 3.62 s/image
+```
+
+**The design is compute-bound at every buffer size that fits.** 46.4 GMAC per image
+against 256 MACs per cycle is 3.62 seconds, and no tiling changes that. The best tiling's
+DRAM traffic is 2.61 s, comfortably underneath. Growing the buffers past 64 KB moves the
+DRAM number and nothing else: 160 KB of buffers buys 2.45 s, 320 KB buys 2.45 s, and the
+image still takes 3.62 seconds.
+
+That contradicts the ordering §6.13 left behind, which put throughput — the DMA's single
+outstanding request, the vector unit's two cycles per element — ahead of the array. Those
+were measured on a 16-token block where the buffers held everything and the bus was 58%
+of the time. At real dimensions the bus has slack and the array does not. §6.12's
+measurement was correct about the block it measured and misleading about the model.
+
+At 1024 MACs per cycle — a 32×32 array — compute drops to 0.91 s and DRAM becomes the
+binding constraint at 2.61 s. That is the point at which the DMA's outstanding-request
+limit and the buffer sizes start to matter, and not before.
+
+#### Attention is 42% of the traffic
+
+Worth recording separately, because it is a scheduling problem rather than a hardware
+one. `logit` and `ctx` account for 36.4 MB of the 87.1 MB. At 1370 tokens the per-head
+probability matrix is 1370² = 1.88 MB, six of them per block, and the schedule as written
+materializes each one in full before consuming it. Tiling attention over query blocks —
+computing a band of rows of `P`, normalizing it, and multiplying it into `V` before moving
+on — removes almost all of that, and needs no new hardware, only a different order in the
+generator. It is not urgent while the array is the bottleneck, which is precisely the kind
+of thing worth writing down now and not doing yet.
+
+#### What was verified
+
+The tiler is checked by `sw/tests/test_tiling.py` — hand-computable single-call cases, the
+weight buffer's k-row indexing at the exact boundary, and monotonicity (a larger buffer
+can never cost more traffic, since its set of legal tilings contains the smaller one's).
+
+The RTL is checked at the two deepest tile shapes a real block asks for, added to the
+`tb_gemm_seq` sweep:
+
+```
+PASS gemm_seq 21x1536x32 (96 k tiles, 2 n tiles, MBLK=16): 1344/1344 bit-exact vs qlinear()
+PASS gemm_seq 5x1370x32  (86 k tiles, 2 n tiles, MBLK=16):  320/320 bit-exact vs qlinear()
+```
+
+96 k tiles against the 1 to 4 every previous case used. Both at base zero and at
+non-zero operand bases.
+
+The 48 KB weight buffer still routes, which was the other thing that had to be true.
+Rerunning §6.13's flow with `WGT_WORDS = 3072`:
+
+| | 8 KB weights | 48 KB weights |
+|---|---|---|
+| LUTs | 68,133 (50.9%) | 68,158 (50.9%) |
+| Registers | 62,576 (23.3%) | 62,582 (23.3%) |
+| BRAM tiles | 87 (23.8%) | 115 (31.5%) |
+| WNS / WHS | +0.160 / +0.017 ns | +0.104 / +0.024 ns |
+| DRC violations | 197 | 197 |
+
+Six times the weight buffer costs 28 block RAMs and 25 LUTs. That is what the §6.13
+inference work bought: at distributed RAM prices this would have been ~18,000 LUTs and
+would not have fitted.
+
+What is *not* verified is a whole block at 1370 tokens, and it will not be by simulation:
+6,428 GEMM calls at these shapes is more cycles than xsim will deliver in a working day.
+The 24-op block in §6.11 stays the end-to-end check on the SoC seam, `tb_gemm_seq` covers
+the tile shapes, and the tiler covers the arithmetic that connects them. Closing the last
+gap needs the tiled program emitted and run on hardware, not in a simulator.
+
+### 6.15 Remaining
 
 Only `verible-verilog-lint` is still missing, which makes `srcs.lint` unavailable. It is
 optional — a code-quality check, not a build step — so it is not blocking.
 
 **Next, in order:**
 
-1. Throughput, in the order the measurement puts it: the engine's 44% (the vector unit's
-   two cycles per element and softmax's three passes), the DMA's 29% (one outstanding
-   request), and the config writes' 27% (constants re-uploaded per op rather than per
-   layer). All three are pipelining or caching problems, and none of them changes
-   behaviour.
-2. The array at 32×32, now that §6.13 says a 16×16 one costs half the LUTs and a quarter
-   of the registers of the part. DSP-mapped PEs come first, since 1024 LUT-mapped MACs
-   would not.
+1. **The array**, which §6.14 says is the only thing standing between here and a
+   reasonable frame time: 3.62 s/image at 16×16 and 50 MHz, against 2.61 s of DRAM
+   traffic that is already comfortably underneath it. 32×32 takes compute to 0.91 s.
+   DSP-mapped PEs come first — §6.13 leaves 51% of the LUTs free, which 1024 LUT-mapped
+   MACs would not fit into, and 88% of the DSPs are idle.
+2. **The tiled block program**: emitting a real-dimension block from
+   `gen_block_vectors.py` using `sw/tiling.py`'s tiling, and running it on the board.
+   Simulation cannot reach it, so this is what the bitstream is for.
+3. **Throughput**, which §6.12 measured and §6.14 demoted: the engine's 44%, the DMA's
+   29%, the config writes' 27%. These bind only once the array is faster than the bus,
+   which is to say after item 1.
 
-**Deferred, with reasons:** im2col address generation (the DPT head needs it, one
-transformer block does not);
+**Deferred, with reasons:** query-block tiling for attention (§6.14: 42% of a block's
+DRAM traffic, but the array is the bottleneck, so it buys nothing yet); im2col address
+generation (the DPT head needs it, one transformer block does not);
 instruction encoding proper (`sw/lower.py`'s `TiledOp` is a cost model — `macs`, `cycles`,
 `dram_bytes` — with no addresses or loop bounds; the `blk_op_t` table in §6.11 is the
 first real step toward it); softmax accuracy at 1.4 dB SQNR, the worst op in the graph.
