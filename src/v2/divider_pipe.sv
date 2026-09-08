@@ -44,7 +44,7 @@ module divider_pipe #(
     logic                s_dz   [NUM_BITS+1];
     logic                s_val  [NUM_BITS+1];
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             s_val[0] <= 1'b0;
         end else begin
@@ -65,7 +65,7 @@ module divider_pipe #(
         wire [DEN_BITS:0] rem_sh = {s_rem[i][DEN_BITS-1:0], s_num[i][NUM_BITS-1]};
         wire              fits   = !s_dz[i] && (rem_sh >= {1'b0, s_den[i]});
 
-        always_ff @(posedge clk or posedge rst) begin
+        always_ff @(posedge clk) begin
             if (rst) begin
                 s_val[i+1] <= 1'b0;
             end else begin
@@ -85,7 +85,7 @@ module divider_pipe #(
     // away from zero, which a non-zero remainder detects.
     localparam int L = NUM_BITS;
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             valid_out <= 1'b0;
             quot_out  <= '0;

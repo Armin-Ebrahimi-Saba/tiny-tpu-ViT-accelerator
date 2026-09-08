@@ -70,6 +70,18 @@ All three were found by the vector tests, and all three are easy to reintroduce:
 `test/v2/gen_vectors.py` therefore keeps its saturation cases confined to single rows
 and columns and leaves everything else random.
 
+## Reset
+
+Every register here resets synchronously: `always_ff @(posedge clk)` with `if (rst)`
+inside, never `@(posedge clk or posedge rst)`. On the FPGA the reset is released
+synchronously after the MMCM locks, and Xilinx flops power up to their INIT value
+anyway, so an asynchronous reset buys nothing — and it costs a great deal. DSP48 and
+BRAM registers have synchronous reset only, so a register with an asynchronous one
+cannot be absorbed into the block it feeds. Ten of these modules originally had async
+resets, and Vivado reported 612 DRC and 374 methodology violations for them, every one
+of the form "this is preventing the possibility of merging these registers into the DSP
+block".
+
 ## The two sequencers
 
 `gemm_seq.sv` and `vpu_seq.sv` are the only modules here that decide *when* anything

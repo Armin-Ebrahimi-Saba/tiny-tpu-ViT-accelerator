@@ -54,7 +54,7 @@ module isqrt #(
     wire [REM_BITS-1:0] trial  = {{(REM_BITS-BITS/2-2){1'b0}}, root, 2'b01};
     wire                fits   = (rem_sh >= trial);
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             busy      <= 1'b0;
             valid_out <= 1'b0;

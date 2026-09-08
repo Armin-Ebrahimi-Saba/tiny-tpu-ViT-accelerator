@@ -98,9 +98,11 @@ module gemm_seq #(
     state_e state;
 
     // ------------------------------------------------------ per-channel config
-    logic signed [ACC_BITS-1:0] bias_mem  [MAX_N];
-    logic signed [31:0]         mult_mem  [MAX_N];
-    logic [5:0]                 shift_mem [MAX_N];
+    // MAX_N deep and written once per layer, read once per n tile: this is
+    // block RAM, and saying so is worth ~3k LUTs of distributed RAM on Artix-7.
+    (* ram_style = "block" *) logic signed [ACC_BITS-1:0] bias_mem  [MAX_N];
+    (* ram_style = "block" *) logic signed [31:0]         mult_mem  [MAX_N];
+    (* ram_style = "block" *) logic [5:0]                 shift_mem [MAX_N];
 
     always_ff @(posedge clk) begin
         if (cfg_wr_en) begin
@@ -162,7 +164,7 @@ module gemm_seq #(
     logic signed [7:0] sk_d [ROWS][ROWS];
     logic              sk_v [ROWS][ROWS];
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             for (int k = 0; k < ROWS; k++)
                 for (int j = 0; j < ROWS; j++) sk_v[k][j] <= 1'b0;
@@ -213,7 +215,7 @@ module gemm_seq #(
         for (int c = 0; c < COLS; c++) acc_rd[c] <= acc_mem[c][acc_raddr[c]];
     end
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             for (int c = 0; c < COLS; c++) begin
                 mc[c]   <= '0;
@@ -255,7 +257,7 @@ module gemm_seq #(
 
     assign out_we = rq_valid[0];
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             state      <= S_IDLE;
             busy       <= 1'b0;

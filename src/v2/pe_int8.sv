@@ -60,7 +60,7 @@ module pe_int8 #(
     // this PE's previous weight on the next beat.
     assign weight_out = weight_shadow;
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst || !enable) begin
             data_out      <= 8'sd0;
             weight_active <= 8'sd0;

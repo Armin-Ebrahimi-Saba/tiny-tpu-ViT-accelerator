@@ -211,10 +211,18 @@ the result against vectors exported from the emulator.
 
 ## 6. Status and open items
 
-**Done:** GEMM tile built, verified bit-exact over seven geometries, synthesized with
-timing and area measured on the target part. Platform analysis complete; bandwidth
-question settled. rvlab Python toolchain installed (`pydesignflow`, `hjson`, `mako`,
-`lxml`, `notcl`); `flow` runs and lists all targets.
+**Done:** the datapath, the SoC seam and one whole transformer block, every intermediate
+bit-exact against the emulator, running on the CV32E40P over the real bus; and a routed
+bitstream for the Nexys Video that closes timing at 50 MHz using half the XC7A200T's
+LUTs and a quarter of its registers. Platform analysis complete; bandwidth question
+settled. rvlab Python toolchain installed (`pydesignflow`, `hjson`, `mako`, `lxml`,
+`notcl`); `flow` runs and lists all targets.
+
+**Not done:** the network. One block is not 12 blocks, and the DPT head needs im2col
+address generation that does not exist yet. Weights still come from BRAM in simulation
+because the fast batch flow builds without the DDR3 model; the descriptor for a
+`0x8xxxxxxx` source is identical and the crossbar routes it without the DMA knowing, but
+that path has not been run.
 
 ### 6.1 Toolchain resolved, integration proven
 
@@ -814,25 +822,126 @@ in-place vector op reading and writing the same slot (softmax over the attention
 probabilities). That last one is only safe because the reader leads the packer by a whole
 word, which is worth knowing rather than assuming — a transpose done in place would not be.
 
-### 6.13 Remaining
+### 6.13 Step 11 — the board
+
+The first synthesis of the whole SoC with tiny-tpu in it, on `xc7a200tsbg484-1` at
+50 MHz. It did not fit, twice, for two different reasons, and both are worth recording
+because neither is visible in simulation.
+
+#### It did not fit: 362,917 LUTs on a 134,600-LUT part
+
+`place_design` failed outright. 270% of the LUTs and 113% of the registers, with 70,915
+F7 and 33,281 F8 muxes — the signature of a memory implemented as flip-flops behind a
+mux tree. `WARNING: [Synth 8-11357] ... for RAM bank_reg with 65536 registers` named it:
+none of the three data buffers had become memory at all.
+
+The cause was the second read port added in §6.12. **Vivado does not replicate an array
+to serve a third port; it dissolves the whole array into registers.** The comment I wrote
+when adding that port claimed the opposite, and simulation had no opinion either way.
+
+The fix is to do the replication in RTL: one copy of the array per reader, every write
+mirrored into all of them, so each copy has exactly one write access and one read
+access — the shape a true dual-port BRAM actually has. That took it to 113,004 LUTs
+(84%) with the SoC block still bit-exact.
+
+#### It fitted but wastefully: 24,082 LUTs of distributed RAM
+
+The copies were memory now, but LUT memory. `(* ram_style = "block" *)` came back
+`WARNING: [Synth 8-6849] Infeasible attribute ram_style = "block"` — because the read
+sat in its own `always_ff`. Vivado's byte-write-enable BRAM template wants one process
+holding one write and one read, with the address and byte enables already resolved.
+Rewritten that way the buffers became block RAM: 71 → 85 tiles, and 113,004 → 88,120
+LUTs.
+
+That is a real finding about this codebase's style. Splitting a memory's read out of its
+write process reads better and infers worse, and nothing short of synthesis will say so.
+
+#### 612 DRC violations from one habit
+
+With it fitting, the warning sweep `task.md` asks for. 813 DRC violations and 458
+methodology violations, and — unusually — 812 of the 813 were tiny-tpu's own, not the
+CPU's or the DDR3 controller's. One rule dominated:
+
+```
+DPOR-1  Asynchronous load check  612
+DSP .../u_gemm/g_requant[0].u_rq/prod output is connected to registers with an
+asynchronous reset ... This is preventing the possibility of merging these
+registers in to the DSP Block since the DSP block registers only possess
+synchronous reset capability.
+```
+
+Ten of the eighteen modules in `src/v2/` had been written `always_ff @(posedge clk or
+posedge rst)` and the rest `always_ff @(posedge clk)`. The inconsistency was invisible
+in simulation and cost 612 DRC plus 374 methodology violations, because DSP48 and BRAM
+registers have synchronous reset only: a register with an asynchronous one cannot be
+absorbed into the block it feeds.
+
+Converting all of them to synchronous reset is safe here and not a compromise. `sys_rst_n`
+in `rvlab_fpga_top.sv` is released synchronously after the MMCM locks, and Xilinx flops
+power up to their INIT value, so the design is already in a reset state before the clock
+that would apply the reset. The asynchronous reset was buying nothing at all.
+
+#### Where it landed
+
+| | first synth | replicated | block RAM | sync reset |
+|---|---|---|---|---|
+| LUTs | 362,917 (270%) | 113,004 (84%) | 88,120 (65%) | **68,133 (51%)** |
+| Registers | 304,734 (113%) | 106,042 (39%) | 105,142 (39%) | **62,576 (23%)** |
+| BRAM tiles | 71 | 71 | 85 | **87 (24%)** |
+| DSPs | 91 | 91 | 91 | **91 (12%)** |
+| DRC violations | — | 813 | 813 | **197** |
+| Methodology | — | 458 | 458 | **298** |
+| `place_design` | failed | — | — | **routed** |
+
+Timing is met at 50 MHz with margin on both edges: WNS +0.160 ns, WHS +0.017 ns, TNS and
+THS zero, no failing endpoints of 178,645. The bitstream is 9,730,763 bytes.
+`rvlab_fpga_top.io_report.txt` is clean — no pins missing in either direction.
+
+The last column is the honest one to read: half the LUTs, a quarter of the registers,
+and the arithmetic living in DSPs and block RAM rather than in fabric. Two of the three
+remaining resources are under a quarter used, which is what makes the 32×32 array a
+question worth asking rather than a fantasy.
+
+#### What is left, and why
+
+197 DRC and 298 methodology violations remain, all Warning or Advisory, none blocking:
+
+- **DPOP-1/DPOP-2/DPIP-1 (175)** and **DPIR-1 (214)** — "pipelining this multiplier would
+  improve performance", and "this DSP input is driven by a register with an asynchronous
+  reset". The asynchronous reset is now always OpenTitan's `prim_subreg.sv`, which is
+  what every configuration register in the map is built from, so every constant that
+  reaches a multiplier arrives through one. `task.md` asks for these fixed *without
+  changing third party libraries if possible*, and this is the case where it is not
+  possible. The pipelining advisories are the same story from the other side: the
+  registers that would have been absorbed cannot be.
+- **REQP-1840 (20)** — the buffers' BRAM address is driven by a TL-UL FIFO pointer with an
+  asynchronous reset, again rvlab's. Benign here: the write enable is gated on a bus
+  request, which cannot be asserted during reset, so there is nothing to corrupt.
+- **SYNTH-5 / RTGT-1 (8)** — `gemm_seq`'s per-channel bias, multiplier and shift memories
+  are still LUT RAM, about 3k LUTs. Same cause as the buffers, but the read sits inside
+  the block sequencer's FSM and moving it into the write process shifts the constant
+  fetch by a cycle. That is a change to a verified sequencer for 2% of the LUTs, so it
+  is written down rather than done.
+- **SYNTH-10 (75)** — wide multipliers, which is what a requantizer is.
+
+### 6.14 Remaining
 
 Only `verible-verilog-lint` is still missing, which makes `srcs.lint` unavailable. It is
 optional — a code-quality check, not a build step — so it is not blocking.
 
 **Next, in order:**
 
-1. The board: bitstream, then the `io_report` / syn / pnr warning sweep `task.md` asks
-   for. Worth doing before the design grows further, since it is the first real check on
-   whether 256 LUT-mapped MACs plus the vector unit fit and close timing at 50 MHz — and
-   the third buffer port added in §6.12 makes that a more interesting question than it was.
-2. The rest of throughput, in the order the measurement now puts it: the engine's 44%
-   (the vector unit's two cycles per element and softmax's three passes), the DMA's 29%
-   (one outstanding request), and the config writes' 27% (constants re-uploaded per op
-   rather than per layer). All three are pipelining or caching problems, and none of them
-   changes behaviour.
+1. Throughput, in the order the measurement puts it: the engine's 44% (the vector unit's
+   two cycles per element and softmax's three passes), the DMA's 29% (one outstanding
+   request), and the config writes' 27% (constants re-uploaded per op rather than per
+   layer). All three are pipelining or caching problems, and none of them changes
+   behaviour.
+2. The array at 32×32, now that §6.13 says a 16×16 one costs half the LUTs and a quarter
+   of the registers of the part. DSP-mapped PEs come first, since 1024 LUT-mapped MACs
+   would not.
 
-**Deferred, with reasons:** DSP-mapped PEs (needed before 32×32, not before correctness);
-im2col address generation (the DPT head needs it, one transformer block does not);
+**Deferred, with reasons:** im2col address generation (the DPT head needs it, one
+transformer block does not);
 instruction encoding proper (`sw/lower.py`'s `TiledOp` is a cost model — `macs`, `cycles`,
 `dram_bytes` — with no addresses or loop bounds; the `blk_op_t` table in §6.11 is the
 first real step toward it); softmax accuracy at 1.4 dB SQNR, the worst op in the graph.

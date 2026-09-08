@@ -63,7 +63,7 @@ module divider #(
 
     assign ready = (state == S_IDLE);
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             state     <= S_IDLE;
             valid_out <= 1'b0;

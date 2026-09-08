@@ -136,7 +136,7 @@ module softmax_int #(
         .valid_out(out_valid), .out(out_data)
     );
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             state   <= S_IDLE;
             cnt     <= '0;

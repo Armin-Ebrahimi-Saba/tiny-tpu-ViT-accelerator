@@ -41,7 +41,7 @@ module requant_unit #(
 
     wire signed [INTER_BITS-1:0] prod = INTER_BITS'(acc_in) * INTER_BITS'(mult_in);
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             prod_q  <= '0;
             shift_q <= '0;
@@ -62,7 +62,7 @@ module requant_unit #(
     wire signed [INTER_BITS:0] rounded = (INTER_BITS+1)'(prod_q) + half;
     wire signed [INTER_BITS:0] shifted = rounded >>> shift_q;
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             out       <= '0;
             valid_out <= 1'b0;

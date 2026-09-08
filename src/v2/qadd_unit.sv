@@ -46,7 +46,7 @@ module qadd_unit #(
     logic signed [WIDE_BITS-1:0] prod_a, prod_b;
     logic [5:0]                 sha_q, shb_q;
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             v1 <= 1'b0;
         end else begin
@@ -77,7 +77,7 @@ module qadd_unit #(
     logic                        v2;
     logic signed [WIDE_BITS-1:0] wide_a, wide_b;
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             v2 <= 1'b0;
         end else begin
@@ -92,7 +92,7 @@ module qadd_unit #(
     wire signed [WIDE_BITS-1:0] half    = WIDE_BITS'(1) <<< (GUARD_BITS - 1);
     wire signed [WIDE_BITS-1:0] rounded = (acc + half) >>> GUARD_BITS;
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             valid_out <= 1'b0;
             out       <= '0;

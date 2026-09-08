@@ -159,7 +159,7 @@ module layernorm_int #(
 
     wire signed [32:0] biased = 33'(rq_out) + 33'(bpipe[DIV_LAT+RQ_LAT-1]);
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             out_valid <= 1'b0;
             out_data  <= '0;
@@ -171,7 +171,7 @@ module layernorm_int #(
         end
     end
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             state    <= S_IDLE;
             cnt      <= '0;

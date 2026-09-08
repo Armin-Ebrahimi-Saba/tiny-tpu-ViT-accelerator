@@ -42,7 +42,7 @@ module unary_lut #(
         end
     end
 
-    always_ff @(posedge clk or posedge rst) begin
+    always_ff @(posedge clk) begin
         if (rst) begin
             y_out     <= '0;
             valid_out <= 1'b0;
