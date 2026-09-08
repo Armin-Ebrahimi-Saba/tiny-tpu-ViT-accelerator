@@ -1,0 +1,4 @@
+[submodule "rvlab"]
+	path = rvlab
+	url = https://github.com/Armin-Ebrahimi-Saba/rvlab.git
+	branch = tinytpu-peripheral
