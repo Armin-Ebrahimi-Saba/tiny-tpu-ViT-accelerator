@@ -1037,7 +1037,104 @@ The 24-op block in §6.11 stays the end-to-end check on the SoC seam, `tb_gemm_s
 the tile shapes, and the tiler covers the arithmetic that connects them. Closing the last
 gap needs the tiled program emitted and run on hardware, not in a simulator.
 
-### 6.15 Remaining
+### 6.15 Step 13 — what the sibling project found in the DDR3 path
+
+A second project on the same rvlab SoC —
+[RISC-V-ViT-accelerator](https://github.com/Armin-Ebrahimi-Saba/RISC-V-ViT-accelerator) —
+got a full Depth Anything V2 Small inference running on the board, and in doing so found
+three defects in the platform's DDR3 path, none in its own accelerator. This project has
+not exercised that path at all yet (§6.14: the batch simulation has no DDR3), so those
+defects are still ahead of it. This step brings over what transfers, and records what
+does not.
+
+#### What was taken
+
+- **`docs/LESSONS.md`** — the portable rules, symptom → cause → rule, copied unchanged.
+  The single most useful file in that repository.
+- **`docs/DEBUGGING.md`** — the full account, wrong theories included, copied unchanged
+  under a provenance note. Worth reading for the instruments alone: a watchdog register
+  readable over JTAG on a wedged core, accelerator-vs-CPU comparison at model shapes in
+  DDR3, a testbench driver that pipelines requests the way a CPU does, and the negative
+  control every time.
+- **`CLAUDE.md`** — the build pipeline, the register-offset trap, the `pkill` trap, and
+  "define a hardware register when the debugger can't answer", rewritten for this tree's
+  layout and `flow` syntax.
+- **`student_tl_watch.sv`** and its two `ddr_ctrl` registers — the stalled-transaction
+  watchdog, the instrument that found the hang the debugger structurally could not. A
+  dozen flops snooping the DDR3 port, latching the oldest unanswered request, its master,
+  and a saturating stall count. It drives nothing on the bus.
+- **The `a_ready` fix in `rvlab_tlul_ddr.sv`.** The response mux started from the error
+  responder and overrode it when the cache had data — so `a_ready` came from the error
+  responder, which holds it high whenever idle, while its `a_valid` was forced low after
+  calibration. Any request issued while the cache was not ready was handshaked away and
+  accepted by nobody. The CPU rarely hits the window; an accelerator with several writes
+  in flight hits it every run and wedges the CPU unhaltably.
+- **The prefetcher bypass switch**, default bypassed. Their alias test showed the
+  prefetcher returning the wrong line under set aliasing, 65 of 256 reads.
+
+#### What was not taken, and why
+
+**The write-back fix was already here.** `rvlab_ddr_block_cache.sv`'s eviction path sent
+the RAM's raw output, one cycle stale when the line had been written the cycle before —
+one word per tile lost, deterministically, the defect behind their wrong depth map. Their
+fix is `a_data: data_rdata`. Our `rvlab/` submodule is on an upstream that merged the same
+one-line change on 17 July 2026 (commit `ff12462`, "additional minor ddr patches"),
+before this project started. Checked by reading the line, not by assuming.
+
+**Their other cache change was not.** Their tree also gates the data RAM's read index on
+`use_be_port || stall` instead of `stall`, with a comment citing "111 words in 65536
+lost". That measurement is the one their own §8 retracts — it was the checker, not the
+memory — and their §7 records that this gating passed a test which also passed unfixed.
+In this tree's cache `stall` is still high on the cycle `use_be_port` fires, so the
+change is a no-op. Bringing in an unverified change with a retracted justification is
+what `LESSONS.md` warns against, so it stays out.
+
+**The prefetcher they bypassed is not the prefetcher we have.** Their tree carries the
+pre-refactor module; upstream refactored it on 17 July (`951fa84`, "cache bugfix, ddr3
+prefetcher bugfix + refactor"), and their prefetcher is byte-identical to the one that
+commit replaced. Whether the aliasing defect survived the refactor is untested. The
+bypass therefore stays on as insurance — §6.14 says this design's DRAM time is a full
+second under its compute floor, so the bandwidth is affordable — and comes off only with
+their alias testbench ported and passing against the new module. The switch and the
+reason are in the RTL.
+
+**The skid buffer and the behavioural DDR3 model** (`student_tl_rsp_hold.sv`,
+`ddr3_blk_model.sv`, the `RVLAB_DDR_BEHAVIOURAL` back end) were not requested and were
+left. The first works around the cache pulsing `d_valid` for one cycle without looking at
+`d_ready` — a real defect, and the one to remember when this project's DMA grows a second
+outstanding request. The second is what their alias and `d_ready` testbenches run on, in
+seconds rather than hours, and is the right way to port those tests when the time comes.
+
+#### The register-offset trap, avoided by taking it seriously
+
+Their watchdog registers went in *ahead of* `ctrl`, moving it from `+0x4` to `+0xc`, and
+software built against the old map wrote the DDR3 reset bit into a read-only address —
+their §4. Here they are appended after `ctrl`, so `status` and `ctrl` keep their offsets
+and nothing already built is invalidated. The comment in the `.hjson` says why.
+
+#### Verified
+
+The batch simulation, which has no DDR3, is unaffected by construction; it was rerun to
+prove the register map and driver still build, and every op is still bit-exact. The DDR3
+path exists only in the FPGA build, so the check on the watchdog, the `a_ready` mux and
+the prefetcher bypass is synthesis, place-and-route and the bitstream, with CLAUDE.md's
+warning sweep:
+
+| | §6.14 | with the DDR3 fixes |
+|---|---|---|
+| LUTs | 68,158 (50.9%) | 67,061 (50.1%) |
+| Registers | 62,582 | 62,616 |
+| WNS / WHS | +0.104 / +0.024 ns | +0.218 / +0.020 ns |
+| DRC | 197 | 197 |
+| Methodology | 298 | 300 |
+| `io_report` | clean | clean |
+
+The bypassed prefetcher is ~1,100 LUTs of logic gone; the watchdog is 34 registers. The two
+new methodology advisories are RTGT-1 on the block manager's request buffer — a
+third-party LUT RAM that Vivado now thinks could be retargeted — not on anything added.
+`ctrl` is still at `+0x4`; `wdog_addr` and `wdog_stat` are at `+0x8` and `+0xc`.
+
+### 6.16 Remaining
 
 Only `verible-verilog-lint` is still missing, which makes `srcs.lint` unavailable. It is
 optional — a code-quality check, not a build step — so it is not blocking.
