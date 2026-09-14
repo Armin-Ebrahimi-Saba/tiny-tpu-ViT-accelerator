@@ -1134,7 +1134,97 @@ new methodology advisories are RTGT-1 on the block manager's request buffer — 
 third-party LUT RAM that Vivado now thinks could be retargeted — not on anything added.
 `ctrl` is still at `+0x4`; `wdog_addr` and `wdog_stat` are at `+0x8` and `+0xc`.
 
-### 6.16 Remaining
+### 6.16 Step 14 — silicon
+
+Everything above this line was simulation. The board was connected, so this step is
+the first time any of it ran on the XC7A200T.
+
+#### The self-test on hardware
+
+`flow rvlab_fpga_top program`, then the driver over JTAG:
+
+```
+tinytpu: id ok
+tinytpu: PASS 24x32x32 GEMM, 192 words bit-exact vs qlinear() (96 DMA spins, 40 poll spins)
+tinytpu: PASS vector ops -- 64 unary, 64 qadd, 2x32 softmax, 2x40 layernorm, all bit-exact
+tinytpu: PASS transformer block -- 24 ops (16x32 tokens, 2 heads), every intermediate bit-exact (686 DMA spins, 1203 engine spins)
+tinytpu: cycles: dma 13674, engine 20352, config 12358 (sum 46384)
+execution finished in 0.1 s, return value 0
+```
+
+The GEMM, all five vector ops, and the 24-op transformer block, every intermediate
+bit-exact on silicon. The cycle count is 46,384 against the simulation's 46,403 — the
+difference is the CPU's own poll timing, not the engine's.
+
+Two things had to be built to get that line. `flow sw_project run` puts the terminal in
+raw mode and starts OpenOCD inside an xterm, so it dies with `Inappropriate ioctl` under
+any redirection; `tools/run_fpga.py` is the non-interactive version, and it prints the
+`downloaded ... verified ...` lines from OpenOCD's own log because `load_image` fails
+silently otherwise — the first run of it did fail silently, and the board ran the course's
+`test_rvlab` out of the bitstream's BRAM init instead, which passed 4/4 and looked exactly
+like a run. (A useful accident: that was a full 512 MB DDR3 memtest through the `a_ready`
+fix and the prefetcher bypass, 4.60 cycles/byte read, clean.) The cause was OpenOCD's view
+of the target lagging the DMI reset-halt; the runner now asks for `halt` through OpenOCD
+too and refuses to load into anything but `halted`. On timeout it prints the §6.15
+watchdog registers before anything else.
+
+#### The model in DDR3
+
+`tools/load_model.py` with the sibling project's exported blob:
+
+```
+tinytpu: BLOB_READY
+writing 24871428 bytes to 0x80000000 ...
+  downloaded 24871428 bytes in 67.410912s (360.305 KiB/s)
+tinytpu: blob magic 32564144 version 2 tensors 299 total 24871428 bytes
+tinytpu: blob checksum (device) c9fad970 over 24871428 bytes, 89276668 cycles (3675 cycles/KB)
+model loaded: 24871428 bytes in DDR3, checksum c9fad970 matches the file
+```
+
+The driver brings DDR3 up, prints `BLOB_READY`, and spins on a flag **in BRAM** — not in
+DDR3, where the CPU would read it stale through the cache for as long as the line stayed
+resident; the sibling project lost a day to that. The host writes the blob with
+`load_image ... bin` at 360 KiB/s, sets the flag, and compares a rotate-xor over every
+word, computed on the device through the CPU's own cached path, against the same sum over
+the file. 24.87 MB of Depth Anything V2 Small — all 299 tensors — are in DRAM on the board
+and read back correctly. The flag's address is taken from the ELF's symbol table, so a
+relink cannot move it out from under the script.
+
+#### Why there is no depth map yet, precisely
+
+The ask was to run images. That needs a runtime: something that walks the graph, tiles
+every GEMM per §6.14, drives the vector unit for softmax, layernorm, GELU and the residual
+adds, does patch embedding and the DPT head, and moves activations between DRAM and the
+buffers. This project has the emulator that specifies all of that (`sw/`) and the
+hardware that executes each op; it does not have the program in between.
+
+The sibling project has such a runtime — `dav2_engine.c`, 2,500 lines, 94 s a frame at
+126×126 — and the tempting route is to put tiny-tpu underneath it. Its accelerator
+interface is what decides that:
+
+```
+acc[m][n] = Σ_k a[n][k] · w[m][k]      a: int16, w: int8, acc: int32, all in DDR3
+```
+
+`int16` activations in, `int32` accumulators out, float requantization in software.
+tiny-tpu takes `int8` activations and emits `int8` results by design (§6.12 is built on
+it). A shim would have to requantize their activations to `int8` on the way in and
+expand tiny-tpu's `int8` results back to a coarse `int32` on the way out — which puts the
+whole model into the int8-everything regime `sw/` measured at 15.9 dB SQNR / Pearson
+0.937 (§2), against their 0.9998. Recognisable depth maps, not their depth maps. It would
+also need their `[M][K]` weights turned into tiny-tpu's `[K][N]` layout — the transpose
+op can do that on the fly, 16 output channels at a time, and `src_b.region` lets the GEMM
+read the result in place — and a per-GEMM output shift chosen without seeing the
+accumulator, which is the part with no clean answer.
+
+The other route is this project's own runtime, from `sw/lower.py`'s graph, with the
+numerics it was designed for. Bigger, and the right one.
+
+Either is days, not a session. What this step leaves behind is the two halves that both
+routes need and that did not exist this morning: the hardware proven on silicon, and the
+weights in DRAM with a way to prove they got there.
+
+### 6.17 Remaining
 
 Only `verible-verilog-lint` is still missing, which makes `srcs.lint` unavailable. It is
 optional — a code-quality check, not a build step — so it is not blocking.
@@ -1146,9 +1236,11 @@ optional — a code-quality check, not a build step — so it is not blocking.
    traffic that is already comfortably underneath it. 32×32 takes compute to 0.91 s.
    DSP-mapped PEs come first — §6.13 leaves 51% of the LUTs free, which 1024 LUT-mapped
    MACs would not fit into, and 88% of the DSPs are idle.
-2. **The tiled block program**: emitting a real-dimension block from
-   `gen_block_vectors.py` using `sw/tiling.py`'s tiling, and running it on the board.
-   Simulation cannot reach it, so this is what the bitstream is for.
+2. **The runtime** — the program between `sw/` and the hardware. First a real-model
+   GEMM from the blob now in DDR3 (§6.16): DMA a weight slice, transpose it into
+   tiny-tpu's layout with the vector unit, run at the §6.14 tile shape, compare against
+   the emulator over the same bytes. Then the tiled block, then the graph. Simulation
+   cannot reach any of it; the board can, in seconds.
 3. **Throughput**, which §6.12 measured and §6.14 demoted: the engine's 44%, the DMA's
    29%, the config writes' 27%. These bind only once the array is faster than the bus,
    which is to say after item 1.

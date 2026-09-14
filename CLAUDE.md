@@ -44,6 +44,16 @@ With no arguments it lists every target and its status.
     flow rvlab_fpga_top bitstream        # builds syn+pnr if missing
     flow rvlab_fpga_top program
 
+    # 5. on the board (from rvlab/; python -u so a hang is not a buffered print)
+    python -u src/sw/project/tools/run_fpga.py                 # self-test, ~0.1 s
+    python -u src/sw/project/tools/load_model.py --blob X.bin  # weights into DDR3, ~70 s
+
+`flow sw_project run` needs a real terminal and an xterm; the two scripts
+above do not. Both print OpenOCD's `downloaded/verified` lines: a load that
+fails silently leaves the board running the course's `test_rvlab` from the
+bitstream's BRAM init, which passes 4/4 and looks like a run. Loading the
+ELF resets the SoC, so DDR3 is back in reset until the program releases it.
+
 A finished target is not rebuilt when its sources change. Force it with
 `flow rvlab_fpga_top <task> --clean` for each of bitstream, pnr, syn, then
 run bitstream; or `-R` to rebuild dependencies. A run that reports numbers
