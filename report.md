@@ -1224,7 +1224,59 @@ Either is days, not a session. What this step leaves behind is the two halves th
 routes need and that did not exist this morning: the hardware proven on silicon, and the
 weights in DRAM with a way to prove they got there.
 
-### 6.17 Remaining
+### 6.17 Step 15 — the runtime, increment 1: one real GEMM out of DDR3
+
+§6.16 ended with the weights in DRAM and no program to use them. The choice in front
+of the runtime was where the decisions live: on the CV32E40P, where a tiling bug is a
+C bug found through a 30-byte-a-second hostio ring, or in `sw/`, where it is a Python
+bug found by reading a file. The split `gen_block_vectors.py` and `run_block()` already
+use at T=16 (§6.11) answers it, generalised: **the exporter decides everything, the
+driver interprets.**
+
+`sw/export_tpu.py` writes a blob: a 64-byte header, one 96-byte descriptor per
+hardware op, then a 16-byte-aligned data area holding every byte the descriptors name —
+weights already in the buffer's `[K][Nt]` layout, per-channel `(bias, mult, shift)`
+already in the config region's `[c][4]` layout, the emulator's expected result for each
+tile. Descriptors carry absolute DRAM addresses, the register values verbatim
+(`src_a`, `src_b`, `dst`, `shape`, the vector unit's five), DMA sources and lengths,
+and an optional result-copy target and check. `emit_gemm()` tiles with `sw/tiling.py`
+(§6.14): the weight tile and its config are named once per n tile, the m tiles under it
+name only their rows, which is weight reuse made visible in the stream.
+
+`rvlab/src/sw/project/tpu_runtime.c` is the other half: 150 lines that walk the list
+and do, per descriptor, what `run_block()` does per op — DMA A and B if named, copy the
+config words, set the registers, start, poll, copy the result out, check. It makes no
+decision and sees no float. `tpu.h` holds the register macros both drivers share;
+`load_model.py` waits for the verdict after the checksum. `sw/tests/test_export_tpu.py`
+reads a written blob back the way the C does and checks that every address it names
+points at the bytes the hardware wants.
+
+The first program is block 0's q projection for head 0 at real width — `[384]×[64]`
+with `1/√d` folded into the weights, as `sw/` does — over 82 synthetic tokens. The tiler
+cuts it into m tiles of 21, 21, 21, 19 under one 64-wide n tile: 4 hardware calls,
+62,976-byte blob. On the board:
+
+```
+tinytpu: blob v1, 5 descriptors, 62976 bytes
+tinytpu: PASS blob -- 4 ops, 0 failed
+tinytpu: cycles: dma 105719 (56064 bytes), config 5900, engine 48186, result copy 0; verify 149124
+```
+
+Bit-exact against `qlinear()` over real weights, for every one of 82×64 outputs. This is
+the first time the DMA has read operands out of DDR3 rather than the CPU's BRAM, and
+the number to keep is **1.9 cycles/byte** — twice the BRAM-sourced figure in §6.12,
+which is the cache-line-at-a-time TL-UL port with the prefetcher off (§6.15), and the
+first datum for item 3 of Remaining.
+
+The first run of the day read `id = 0xaffe`: the board had been power-cycled and was
+running whatever the configuration flash holds. `flow rvlab_fpga_top program` first.
+
+**Known costs, on purpose.** Results leave the chip through the CPU, one aperture load
+and one DRAM store per word — the DMA only fills buffers. Config loads are CPU word
+copies. Both are the price of the first picture, not the design; both show up as their
+own cycle counters so they can be priced when they matter.
+
+### 6.18 Remaining
 
 Only `verible-verilog-lint` is still missing, which makes `srcs.lint` unavailable. It is
 optional — a code-quality check, not a build step — so it is not blocking.
@@ -1236,11 +1288,12 @@ optional — a code-quality check, not a build step — so it is not blocking.
    traffic that is already comfortably underneath it. 32×32 takes compute to 0.91 s.
    DSP-mapped PEs come first — §6.13 leaves 51% of the LUTs free, which 1024 LUT-mapped
    MACs would not fit into, and 88% of the DSPs are idle.
-2. **The runtime** — the program between `sw/` and the hardware. First a real-model
-   GEMM from the blob now in DDR3 (§6.16): DMA a weight slice, transpose it into
-   tiny-tpu's layout with the vector unit, run at the §6.14 tile shape, compare against
-   the emulator over the same bytes. Then the tiled block, then the graph. Simulation
-   cannot reach any of it; the board can, in seconds.
+2. **The runtime**, continued from §6.17. Next a block at 82 tokens: the descriptor
+   stream gains the vector ops, activations live in a DDR3 arena between GEMMs, and the
+   emulator writes a side file of every intermediate so each op is checked on the board.
+   Then the encoder — patch embedding as a GEMM over a host-side im2col, the position
+   add, twelve blocks, the four taps — with the DPT head on the CPU in float, which is
+   the first depth image beside PyTorch's. Then the head on the accelerator, and 518×518.
 3. **Throughput**, which §6.12 measured and §6.14 demoted: the engine's 44%, the DMA's
    29%, the config writes' 27%. These bind only once the array is faster than the bus,
    which is to say after item 1.

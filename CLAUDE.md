@@ -14,6 +14,10 @@ Xilinx Artix-7 XC7A200T (Nexys Video), `xc7a200tsbg484-1`, 50 MHz.
 - `src/v2/` — the accelerator RTL. The Python emulator in `sw/` is the
   specification; every module is checked bit-exactly against it by
   `test/v2/run.sh` (Verilator). `sw/tiling.py` sizes the buffers.
+  `sw/export_tpu.py` writes the program blob the board runs: one descriptor
+  per hardware op with every operand pre-laid-out; the driver
+  (`rvlab/src/sw/project/tpu_runtime.c`) only interprets. Format at the top
+  of the exporter; `python -m sw.export_tpu -o X.bin` builds a program.
 - `rvlab/` — git submodule: the SoC (CV32E40P, TL-UL, DDR3, PyDesignFlow).
   `rvlab/src/rtl/tinytpu` is a symlink back to `src/v2`; the peripheral,
   its register map and the driver are `rvlab/src/rtl/student/tinytpu*.sv`,
@@ -46,13 +50,15 @@ With no arguments it lists every target and its status.
 
     # 5. on the board (from rvlab/; python -u so a hang is not a buffered print)
     python -u src/sw/project/tools/run_fpga.py                 # self-test, ~0.1 s
-    python -u src/sw/project/tools/load_model.py --blob X.bin  # weights into DDR3, ~70 s
+    python -u src/sw/project/tools/load_model.py --blob X.bin  # blob into DDR3 and run it
 
 `flow sw_project run` needs a real terminal and an xterm; the two scripts
 above do not. Both print OpenOCD's `downloaded/verified` lines: a load that
 fails silently leaves the board running the course's `test_rvlab` from the
 bitstream's BRAM init, which passes 4/4 and looks like a run. Loading the
 ELF resets the SoC, so DDR3 is back in reset until the program releases it.
+`tinytpu: bad id 0x0000affe` means the FPGA lost its configuration (power
+cycle): `flow rvlab_fpga_top program` again.
 
 A finished target is not rebuilt when its sources change. Force it with
 `flow rvlab_fpga_top <task> --clean` for each of bitstream, pnr, syn, then
