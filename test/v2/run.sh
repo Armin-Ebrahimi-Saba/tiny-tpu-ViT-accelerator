@@ -66,7 +66,7 @@ SHAPES=(
     # sw/tiling.py picks for a 48 KB weight buffer: fc2 (K=1536) and attention's
     # P.V (K=1370). K is the dimension the weight buffer is measured in, so
     # these are the shapes that decide whether the buffers are sized right.
-    "-m 4 -k 8 -n 12 --seq-m 21 --seq-k 1536 --seq-n 32"
+    "-m 4 -k 8 -n 12 --seq-m 21 --seq-k 1536 --seq-n 32 --ln-len 384"
     "-m 6 -k 3 -n 9  --seq-m 5  --seq-k 1370 --seq-n 32"
 )
 

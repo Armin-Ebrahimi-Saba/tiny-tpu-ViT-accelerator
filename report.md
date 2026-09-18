@@ -1276,7 +1276,71 @@ and one DRAM store per word — the DMA only fills buffers. Config loads are CPU
 copies. Both are the price of the first picture, not the design; both show up as their
 own cycle counters so they can be priced when they matter.
 
-### 6.18 Remaining
+### 6.18 Step 16 — the runtime, increment 2: a whole block at real width
+
+One GEMM proved the DMA path; a block proves the *stream* — that every op can find what
+the previous one left, at the real shapes, through the real buffers. Block 0 of the
+model at full width: 384 channels, 6 heads of 64, a 1536-wide MLP, over 82 tokens (a
+126×126 image). Nothing of that fits in an 8 KB result region, so the T=16 block's
+"everything in the result region" lowering (§6.11) does not survive; what replaces it
+is an **arena** in DDR3 above the blob, where every op leaves its output for the next.
+
+Three things the arena made possible, and one it forced:
+
+- **Head concatenation for free.** Format v2's result copy takes a row stride, so
+  each head's `P·V` is written straight into its 64 columns of one `[82][384]` context
+  tensor. The output projection is then one GEMM over the real `proj.weight` — not six
+  K=64 GEMMs summed with five qadds as at T=16. The six heads carry six context scales
+  and the GEMM has one activation scale; each head's ratio is folded into its rows of
+  the weight before quantization, which is exact.
+- **Any token count.** 82 is not a multiple of 16 and needs to be one only along the
+  key axis of the logits, which is a GEMM's N. Keys and values are padded to 96 rows,
+  and the logit GEMM's per-column bias — a register the hardware already has — pushes
+  the 14 padded columns to −127, which the exp table sends to zero. Softmax then runs
+  at length 96 and P·V reduces over 96 with zero rows contributing nothing. No masking
+  op, no new hardware.
+- **LayerScale with negative gammas.** 177 of block 0's 384 `ls1` gammas are negative,
+  and the requantizer's multiplier is unsigned; the sign folds into the weight column
+  and the bias, exactly.
+- **Padding is read that nothing wrote.** The first board run failed exactly at columns
+  82–95 of every `Kᵀ`: the padded rows of `K` were uninitialized DDR3. The header now
+  carries the arena's size and the driver zero-fills it before the first op — 0.7 MB
+  for this block. A simulation with no DDR3 could not have shown this.
+
+The lowering is checked against an independent float implementation of the block:
+30.4 dB SQNR at the block output over the int8-everything path, in line with §2. On the
+board:
+
+```
+tinytpu: blob v2, 400 descriptors, 2636432 bytes
+tinytpu: PASS blob -- 392 ops, 0 failed
+tinytpu: cycles: dma 9331101 (4871424 bytes), config 504274, engine 5568363, result copy 2611350; verify 19133873
+```
+
+392 hardware ops — 348 GEMM tiles, 16 GELU chunks, 8 layernorm, 8 qadd, 6 transposes,
+6 softmax — every intermediate bit-exact against `sw/kernels_int.py`, over the real
+weights. 18.0 M cycles, **0.36 s per block** at 50 MHz with verification excluded
+(the 19 M cycles of byte-compares are the testbench, not the block). Where they go:
+
+| | cycles | share | note |
+|---|---|---|---|
+| DMA | 9.33 M | 52% | 4.87 MB at 1.9 cycles/byte; activations reloaded per n tile (fc2: 12 n tiles × 17 m tiles) |
+| engine | 5.57 M | 31% | 5.4× the 1.03 M MACs/256 that the array would take at full rate |
+| result copy | 2.61 M | 15% | CPU, one aperture load + one DRAM store per word |
+| config | 0.50 M | 3% | per-channel tables per n tile, exp pair per head |
+
+Twelve such blocks are 4.3 s per 126×126 image before the patch embedding and the head,
+against §6.14's 3.62 s/image compute-bound estimate for a 518×518 image — the model
+still holds, and the two gaps it names are visible in the table: the DMA's 1.9
+cycles/byte (§6.15's cache-line port with the prefetcher off) and the result path
+through the CPU. Both are runtime costs, not array costs; the array is 31% busy.
+
+The sequencer testbench (`tb_vpu_seq`) has a fixed 128-word memory with hard-coded
+slot offsets and cannot hold a 21×384 layernorm or an 82×96 softmax; the kernel-level
+`tb_layernorm_int` now runs at 384 in the sweep, and the sequencer at those shapes was
+proven on the board instead.
+
+### 6.19 Remaining
 
 Only `verible-verilog-lint` is still missing, which makes `srcs.lint` unavailable. It is
 optional — a code-quality check, not a build step — so it is not blocking.
@@ -1288,12 +1352,10 @@ optional — a code-quality check, not a build step — so it is not blocking.
    traffic that is already comfortably underneath it. 32×32 takes compute to 0.91 s.
    DSP-mapped PEs come first — §6.13 leaves 51% of the LUTs free, which 1024 LUT-mapped
    MACs would not fit into, and 88% of the DSPs are idle.
-2. **The runtime**, continued from §6.17. Next a block at 82 tokens: the descriptor
-   stream gains the vector ops, activations live in a DDR3 arena between GEMMs, and the
-   emulator writes a side file of every intermediate so each op is checked on the board.
-   Then the encoder — patch embedding as a GEMM over a host-side im2col, the position
-   add, twelve blocks, the four taps — with the DPT head on the CPU in float, which is
-   the first depth image beside PyTorch's. Then the head on the accelerator, and 518×518.
+2. **The runtime**, continued from §6.18. Next the encoder: patch embedding as a GEMM
+   over a host-side im2col, the position add, twelve blocks chained through the arena,
+   the four taps copied out — with the DPT head on the CPU in float, which is the first
+   depth image beside PyTorch's. Then the head on the accelerator, and 518×518.
 3. **Throughput**, which §6.12 measured and §6.14 demoted: the engine's 44%, the DMA's
    29%, the config writes' 27%. These bind only once the array is faster than the bus,
    which is to say after item 1.
