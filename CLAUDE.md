@@ -52,6 +52,10 @@ With no arguments it lists every target and its status.
     python -u src/sw/project/tools/run_fpga.py                 # self-test, ~0.1 s
     python -u src/sw/project/tools/load_model.py --blob X.bin  # blob into DDR3 and run it
 
+    # 6. depth maps for any pictures (from the repo root): one program, 4.5 s each
+    python -m sw.export_tpu --calib sw/calib_vits_126.json --program-only -o P.bin
+    python -m sw.depth_on_board P.bin assets/examples/*.jpg --out results/
+
 `flow sw_project run` needs a real terminal and an xterm; the two scripts
 above do not. Both print OpenOCD's `downloaded/verified` lines: a load that
 fails silently leaves the board running the course's `test_rvlab` from the

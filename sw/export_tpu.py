@@ -135,6 +135,45 @@ def qscale(x: np.ndarray) -> float:
     return max(float(np.abs(x).max()), 1e-9) / INT8_MAX
 
 
+class Calibration:
+    """Where activation scales come from.
+
+    By default each scale is taken from the tensor being quantized -- the
+    image's own fp32 forward, which is exact for that image and is what the
+    increments up to 6.19 did. That makes the program image-specific and puts
+    the fp32 model on the host for every picture.
+
+    `record()` runs over a calibration set and keeps, per named activation,
+    the largest |x| (or its `percentile`); `fixed` then returns those scales
+    whatever the input. With fixed scales the whole program is independent of
+    the image and only the input tensor changes between pictures.
+    """
+
+    def __init__(self, fixed: dict[str, float] | None = None, percentile: float = 100.0):
+        self.fixed = fixed
+        self.percentile = percentile
+        self.amax: dict[str, float] = {}
+
+    def __call__(self, key: str, x: np.ndarray) -> float:
+        a = np.abs(np.asarray(x, dtype=np.float64))
+        amax = float(a.max() if self.percentile >= 100 else np.percentile(a, self.percentile))
+        self.amax[key] = max(self.amax.get(key, 0.0), amax)
+        if self.fixed is not None:
+            return self.fixed[key]
+        return max(amax, 1e-9) / INT8_MAX
+
+    def scales(self) -> dict[str, float]:
+        return {k: max(v, 1e-9) / INT8_MAX for k, v in self.amax.items()}
+
+
+CALIB = Calibration()
+
+
+def act_scale(key: str, x: np.ndarray) -> float:
+    """The scale for activation `key`, per the current Calibration."""
+    return CALIB(key, x)
+
+
 @dataclass
 class Desc:
     op: int
@@ -438,7 +477,7 @@ def emit_layernorm(blob: Blob, name: str, x_q: np.ndarray, x_ref: Ref, s_x: floa
     length = x_q.shape[-1]
     h_f = ((x_f - x_f.mean(-1, keepdims=True))
            / np.sqrt(x_f.var(-1, keepdims=True) + eps)) * gamma_f + beta_f
-    s_out = qscale(h_f)
+    s_out = act_scale(name, h_f)
     s_g = qscale(gamma_f)
     g_q = quant(gamma_f, s_g)
     b_q = np.rint(beta_f / s_out).astype(np.int32)
@@ -496,7 +535,7 @@ def build_gemm_probe(blob: Blob, sd: dict[str, np.ndarray], tokens: int, seed: i
     emit_gemm(blob, "blk0.q0", x_q, None, w_q, b_q, rq)
 
 
-def linear_q(x_f: np.ndarray, s_x: float, w_f: np.ndarray, b_f: np.ndarray,
+def linear_q(key: str, x_f: np.ndarray, s_x: float, w_f: np.ndarray, b_f: np.ndarray,
              per_chan: np.ndarray | None = None):
     """Quantize a [K][N] weight per output channel and derive the requant for
     the float output's own scale. `per_chan` (LayerScale) folds into the
@@ -512,7 +551,7 @@ def linear_q(x_f: np.ndarray, s_x: float, w_f: np.ndarray, b_f: np.ndarray,
     y_f = x_f @ w_f + b_f
     if per_chan is not None:
         y_f = y_f * per_chan
-    s_y = qscale(y_f)
+    s_y = act_scale(key, y_f)
     real = s_x * s_w / s_y
     if per_chan is not None:
         real = real * per_chan
@@ -573,7 +612,7 @@ def build_block(blob: Blob, sd: dict[str, np.ndarray], tokens: int, seed: int,
             w_f, b_f = w_qkv[sl, :].T.copy(), b_qkv[sl].copy()
             if which == "q":                      # DINOv2 folds 1/sqrt(d) into q
                 w_f, b_f = w_f * D ** -0.5, b_f * D ** -0.5
-            w_q, b_q, rq, y_f, s_y = linear_q(h1_f, s_h1, w_f, b_f)
+            w_q, b_q, rq, y_f, s_y = linear_q(f"{nm}{which}{h}", h1_f, s_h1, w_f, b_f)
             # k and v are padded to T_pad rows: the transpose wants whole
             # words per output row, and P.V's reduction runs over T_pad.
             t_rows = T if which == "q" else T_pad
@@ -595,7 +634,7 @@ def build_block(blob: Blob, sd: dict[str, np.ndarray], tokens: int, seed: int,
         # logits [T][T_pad]: the GEMM's per-column bias saturates the padded
         # keys to INT8_MIN, so softmax sees them as -inf as near as the exp
         # table can say.
-        s_logit = max(float(np.abs(q_f @ k_f.T).max()), 1e-9) / INT8_MAX
+        s_logit = act_scale(f"{nm}logit{h}", q_f @ k_f.T)
         rq_l = Requant.from_real_multiplier(s_q * s_k / s_logit)
         bias_l = np.zeros(T_pad, dtype=np.int64)
         bias_l[T:] = -int(math.ceil(2 * INT8_MAX / rq_l.real_multiplier))
@@ -616,7 +655,7 @@ def build_block(blob: Blob, sd: dict[str, np.ndarray], tokens: int, seed: int,
 
         # ctx_h = P.V, written into its head's columns of the [T][E] context.
         c_f = (p_q.astype(np.float64) * s_prob) @ (v_q.astype(np.float64) * s_v)
-        s_c = qscale(c_f)
+        s_c = act_scale(f"{nm}ctx{h}", c_f)
         rq_c = Requant.from_real_multiplier(s_prob * s_v / s_c)
         c_q = emit_gemm(blob, f"{nm}ctx{h}", p_q, p_ref, v_q, np.zeros(D, dtype=np.int64),
                         rq_c, w_ref=v_ref, out_ref=ref_add(ctx_ref, h * D), out_stride=E,
@@ -634,14 +673,15 @@ def build_block(blob: Blob, sd: dict[str, np.ndarray], tokens: int, seed: int,
     for h in range(H):
         w_o[h * D:(h + 1) * D, :] *= s_ctx[h] / s_cx
     ctx_f_common = ctx_q.astype(np.float64) * s_cx           # what the GEMM sees
-    w_oq, b_oq, rq_o, a_f, s_a = linear_q(ctx_f_common, s_cx, w_o, f64("attn.proj.bias"),
+    w_oq, b_oq, rq_o, a_f, s_a = linear_q(nm + "proj", ctx_f_common, s_cx, w_o,
+                                          f64("attn.proj.bias"),
                                           per_chan=f64("ls1.gamma"))
     a_ref = blob.scratch(T * E)
     a_q = emit_gemm(blob, nm + "proj", ctx_q, ctx_ref, w_oq, b_oq, rq_o, out_ref=a_ref,
                     check=check)
 
     x1_f = x_f + a_f
-    s_x1 = qscale(x1_f)
+    s_x1 = act_scale(nm + "res1", x1_f)
     x1_ref = blob.scratch(T * E)
     x1_q = emit_qadd(blob, nm + "res1", x_q, x_ref, s_x, a_q, a_ref, s_a, s_x1, x1_ref,
                      check=check)
@@ -650,12 +690,12 @@ def build_block(blob: Blob, sd: dict[str, np.ndarray], tokens: int, seed: int,
     h2_ref = blob.scratch(T * E)
     h2_q, s_h2, h2_f = emit_layernorm(blob, nm + "norm2", x1_q, x1_ref, s_x1, x1_f,
                                       f64("norm2.weight"), f64("norm2.bias"), h2_ref, check=check)
-    w1q, b1q, rq1, f1_f, s_f1 = linear_q(h2_f, s_h2, f64("mlp.fc1.weight").T.copy(),
+    w1q, b1q, rq1, f1_f, s_f1 = linear_q(nm + "fc1", h2_f, s_h2, f64("mlp.fc1.weight").T.copy(),
                                          f64("mlp.fc1.bias"))
     f1_ref = blob.scratch(T * HID)
     f1_q = emit_gemm(blob, nm + "fc1", h2_q, h2_ref, w1q, b1q, rq1, out_ref=f1_ref, check=check)
 
-    s_g1 = qscale(gelu(f1_f))
+    s_g1 = act_scale(nm + "gelu", gelu(f1_f))
     un_lut = build_unary_lut(gelu, scale_in=s_f1, scale_out=s_g1)
     emit_config(blob, nm + "gelu_lut", CFG_UN_LUT, un_lut.astype(np.int64) & 0xFF)
     g1_q = apply_unary_lut(f1_q, un_lut)
@@ -663,22 +703,41 @@ def build_block(blob: Blob, sd: dict[str, np.ndarray], tokens: int, seed: int,
     emit_flat(blob, nm + "gelu", OP_UNARY, f1_q, f1_ref, g1_q, g1_ref, check=check)
 
     g1_f = g1_q.astype(np.float64) * s_g1
-    w2q, b2q, rq2, f2_f, s_f2 = linear_q(g1_f, s_g1, f64("mlp.fc2.weight").T.copy(),
+    w2q, b2q, rq2, f2_f, s_f2 = linear_q(nm + "fc2", g1_f, s_g1, f64("mlp.fc2.weight").T.copy(),
                                          f64("mlp.fc2.bias"), per_chan=f64("ls2.gamma"))
     f2_ref = blob.scratch(T * E)
     f2_q = emit_gemm(blob, nm + "fc2", g1_q, g1_ref, w2q, b2q, rq2, out_ref=f2_ref, check=check)
 
     y_f = x1_f + f2_f
-    s_y = qscale(y_f)
+    s_y = act_scale(nm + "res2", y_f)
     y_ref = blob.scratch(T * E)
     y_q = emit_qadd(blob, nm + "res2", x1_q, x1_ref, s_x1, f2_q, f2_ref, s_f2, s_y, y_ref,
                     check=check)
     return y_q, y_ref, s_y, y_f
 
 
+def encoder_im2col(image: np.ndarray, patch: int = 14) -> np.ndarray:
+    """[1][3][S][S] -> [T][K] float: one row per patch in (c, kh, kw) order, as
+    the conv weight flattens, K padded to a whole word; row 0 is the cls slot
+    and stays zero."""
+    _, C, S, _ = image.shape
+    g = S // patch
+    x = image[0].astype(np.float64)
+    patches = x.reshape(C, g, patch, g, patch).transpose(1, 3, 0, 2, 4).reshape(g * g, -1)
+    K = (patches.shape[1] + LANES - 1) // LANES * LANES
+    a_f = np.zeros((g * g + 1, K))
+    a_f[1:, :patches.shape[1]] = patches
+    return a_f
+
+
+def encoder_input(image: np.ndarray, scale: float) -> np.ndarray:
+    """The int8 bytes a program blob expects at its input address."""
+    return quant(encoder_im2col(image), scale)
+
+
 def build_encoder(blob: Blob, sd: dict[str, np.ndarray], image: np.ndarray,
                   check: bool = True, taps: tuple[int, ...] = (2, 5, 8, 11),
-                  dump: list[str] = ()) -> dict:
+                  dump: list[str] = (), input_in_arena: bool = False) -> dict:
     """Increment 3: the whole ViT-S encoder over a preprocessed [1][3][S][S]
     image, S a multiple of 14. Returns the sidecar the host needs to finish
     the picture: where each tap's normalized tokens are, and their scales.
@@ -697,25 +756,22 @@ def build_encoder(blob: Blob, sd: dict[str, np.ndarray], image: np.ndarray,
     E, P = 384, 14
     _, C, S, S2 = image.shape
     assert S == S2 and S % P == 0
+    assert not (input_in_arena and check), "a program's expected values would be one image's"
     g = S // P
     T = g * g + 1
     cfg = DAV2Config(img_size=S)
     f64 = lambda k: sd["pretrained." + k].astype(np.float64)  # noqa: E731
 
-    # -- im2col, (c, kh, kw) order to match the weight's flattening ------
-    x = image[0].astype(np.float64)
-    patches = x.reshape(C, g, P, g, P).transpose(1, 3, 0, 2, 4).reshape(g * g, C * P * P)
-    K = (C * P * P + LANES - 1) // LANES * LANES
-    a_f = np.zeros((T, K))
-    a_f[1:, :C * P * P] = patches
-    s_a = qscale(a_f)
+    a_f = encoder_im2col(image)
+    K = a_f.shape[1]
+    s_a = act_scale("embed.in", a_f)
     a_q = quant(a_f, s_a)
-    a_ref = blob.data(a_q)
+    a_ref = blob.scratch(a_q.size) if input_in_arena else blob.data(a_q)
 
     w_f = np.zeros((K, E))
     w_f[:C * P * P, :] = f64("patch_embed.proj.weight").reshape(E, -1).T
     b_f = f64("patch_embed.proj.bias")
-    w_q, b_q, rq, tok_f, s_tok = linear_q(a_f, s_a, w_f, b_f)
+    w_q, b_q, rq, tok_f, s_tok = linear_q("embed", a_f, s_a, w_f, b_f)
     tok_ref = blob.scratch(T * E)
     tok_q = emit_gemm(blob, "embed", a_q, a_ref, w_q, b_q, rq, out_ref=tok_ref, check=check)
 
@@ -725,13 +781,17 @@ def build_encoder(blob: Blob, sd: dict[str, np.ndarray], image: np.ndarray,
     s_const = qscale(const_f)
     const_q = quant(const_f, s_const)
     x_f = tok_f + const_f
-    s_x = qscale(x_f)
+    s_x = act_scale("tokens", x_f)
     x_ref = blob.scratch(T * E)
     x_q = emit_qadd(blob, "tokens", tok_q, tok_ref, s_tok, const_q, blob.data(const_q), s_const,
                     s_x, x_ref, check=check)
 
     # -- twelve blocks, four taps through the final norm ------------------
     side = {"image": S, "tokens": T, "taps": [], "dumps": []}
+    if input_in_arena:
+        # A program: the host writes each picture's im2col here before a run.
+        side["input"] = {"name": "embed.in", "ref": a_ref, "shape": list(a_q.shape),
+                         "scale": float(s_a), "emu": a_q}
     # Debugging: record the input and output of the layernorms named in
     # `dump` so load_model.py reads them back in the run's own session.
     global emit_layernorm
@@ -761,6 +821,42 @@ def build_encoder(blob: Blob, sd: dict[str, np.ndarray], image: np.ndarray,
     return side
 
 
+CALIB_IMAGES = ("skimage:astronaut", "skimage:coffee", "skimage:rocket",
+                "skimage:chelsea", "skimage:cat")
+
+
+def calibrate(sd: dict[str, np.ndarray], images, size: int, percentile: float) -> dict:
+    """Record every activation's range over `images` and return the scales.
+
+    Each image is lowered with its own scales (as an image-specific program
+    would be) on a throwaway blob; the recorder keeps the widest range seen
+    per activation. Scales chain -- a block's input scale shapes its outputs
+    -- so this is the same approximation static calibration always makes."""
+    global CALIB
+    from .imageio import load_image
+    saved, CALIB = CALIB, Calibration(percentile=percentile)
+    try:
+        for img in images:
+            build_encoder(Blob(), sd, load_image(str(img), size), check=False)
+        rec = CALIB
+    finally:
+        CALIB = saved
+    return {"size": size, "percentile": percentile, "images": [str(i) for i in images],
+            "scales": rec.scales()}
+
+
+def run_encoder_emulator(sd: dict[str, np.ndarray], image: np.ndarray, scales: dict[str, float],
+                         taps: tuple[int, ...] = (2, 5, 8, 11)) -> dict[str, np.ndarray]:
+    """What a fixed-scale program computes for `image`: the taps, bit-exact."""
+    global CALIB
+    saved, CALIB = CALIB, Calibration(fixed=scales)
+    try:
+        side = build_encoder(Blob(), sd, image, check=False, taps=taps)
+    finally:
+        CALIB = saved
+    return {t["name"]: t["emu"] for t in side["taps"]}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="write a tiny-tpu program blob")
     ap.add_argument("-o", type=Path, required=True)
@@ -773,10 +869,31 @@ def main() -> None:
     ap.add_argument("--no-check", action="store_true", help="no expected results in the blob")
     ap.add_argument("--dump", action="append", default=[], metavar="OP",
                     help="encoder: also read back this layernorm's input and output, e.g. blk0.norm1")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="record activation scales over --calib-images and write them to -o (JSON)")
+    ap.add_argument("--calib-images", nargs="+", default=list(CALIB_IMAGES))
+    ap.add_argument("--percentile", type=float, default=100.0)
+    ap.add_argument("--calib", type=Path, default=None,
+                    help="encoder: fixed scales from --calibrate instead of the image's own")
+    ap.add_argument("--program-only", action="store_true",
+                    help="encoder: image-independent program; the host writes each input (needs --calib)")
     a = ap.parse_args()
 
     from .frontend.dav2 import load_state_dict
     sd = load_state_dict(a.checkpoint) if a.checkpoint else load_state_dict()
+
+    import json
+    if a.calibrate:
+        cal = calibrate(sd, a.calib_images, a.size, a.percentile)
+        a.o.write_text(json.dumps(cal, indent=1))
+        print(f"wrote {a.o}: {len(cal['scales'])} activation scales over "
+              f"{len(cal['images'])} images at {a.size}x{a.size}, percentile {a.percentile}")
+        return
+    if a.program_only and a.calib is None:
+        ap.error("--program-only needs --calib: a program cannot take scales from an image")
+    if a.calib is not None:
+        global CALIB
+        CALIB = Calibration(fixed=json.loads(a.calib.read_text())["scales"])
 
     blob = Blob()
     if a.program == "gemm-probe":
@@ -789,20 +906,21 @@ def main() -> None:
             image = load_image(a.image, a.size)
         else:
             image = synthetic_image(a.size, np.random.default_rng(a.seed))
-        side = build_encoder(blob, sd, image, check=not a.no_check, dump=a.dump)
+        side = build_encoder(blob, sd, image, check=not (a.no_check or a.program_only),
+                             dump=a.dump, input_in_arena=a.program_only)
     total = blob.write(a.o)
     if a.program == "encoder":
         # The sidecar: what the host needs to read the taps back and finish
         # the picture. The emulator's own taps ride along as .npz so the
         # board's can be compared to them byte for byte.
-        import json
         emu = {}
-        for t in side["taps"] + side["dumps"]:
+        for t in side["taps"] + side["dumps"] + ([side["input"]] if "input" in side else []):
             t["addr"] = blob.address(t.pop("ref"))
             t["bytes"] = int(np.prod(t["shape"]))
             emu[t["name"]] = t.pop("emu")
         side["image_path"] = str(a.image) if a.image else None
         side["seed"] = a.seed
+        side["calib"] = str(a.calib.resolve()) if a.calib else None
         a.o.with_suffix(".json").write_text(json.dumps(side, indent=1))
         np.savez(a.o.with_suffix(".emu.npz"), **emu)
     n_ops = sum(d.op < 0x10 for d in blob.descs)

@@ -1423,7 +1423,67 @@ that is the same weights for every image, and expected results are in the blob a
 Separating weights from the per-image part is the obvious next step for running many
 images.
 
-### 6.20 Remaining
+### 6.20 Step 18 — one program, any picture
+
+Until §6.19 every activation scale came from the picture's own fp32 forward pass. That
+was exact for that picture, but it had two costs. The program depended on the image,
+so each picture meant a new 31.8 MB blob and a 110 s JTAG load. And the host had to run
+the fp32 model just to quantize the input, which is not inference.
+
+**Static calibration.** Every activation scale in the exporter now goes through one
+hook, `act_scale(key, x)`, with 463 named activations in the encoder. By default the
+hook observes the tensor as before: the demo01 blob came out byte-identical to the one
+that passed on the board. `--calibrate` records each activation's range over five
+skimage photographs that are never evaluated (astronaut, coffee, rocket, chelsea, cat)
+and writes `sw/calib_vits_126.json`. With `--calib`, those scales are fixed.
+
+Max or percentile, scored by Pearson against fp32 on the four demo images in the
+emulator:
+
+| scales | demo01 | demo02 | demo05 | demo08 | mean |
+|---|---|---|---|---|---|
+| per image (§6.19) | 0.955 | 0.966 | 0.916 | 0.505 | 0.836 |
+| **fixed, max** | 0.953 | 0.865 | 0.743 | 0.676 | **0.809** |
+| fixed, 99.99th percentile | 0.532 | 0.806 | 0.956 | 0.618 | 0.728 |
+| fixed, 99.9th percentile | 0.068 | 0.970 | −0.384 | 0.750 | 0.351 |
+
+Clipping is catastrophic here even though §2 found the 99.9th percentile best at
+518×518. DINOv2 carries a few channels of very large activations that the network
+relies on, and at 82 tokens a 0.1% tail is about 30 values — exactly those channels.
+Max calibration costs 0.03 in mean Pearson for not running fp32 at all.
+
+**The program.** `--calib F --program-only` puts the im2col'd input in the arena
+instead of the blob and drops the expected values. The rest is weights and constants:
+23.2 MB, byte-identical whichever picture traced it (`test_export_program.py` checks
+that, and that calibrating on one picture reproduces that picture's per-image taps
+exactly). The driver zeroes the arena once (§6.18's padding is never written, so once
+is enough), then loops: `RUN_READY n`, the host writes 48.5 KB of input over JTAG and
+`RUN_GO`, the driver runs and reports. `sw/depth_on_board.py` does the whole thing for
+a list of pictures:
+
+```
+python -m sw.depth_on_board P.bin assets/examples/demo0{1,2,5,8}.jpg --out results/
+  downloaded 23164560 bytes in 80.594536s
+  run 0: PASS in 4.5 s wall      (x4)
+demo01: taps board == emulator; vs fp32 Pearson 0.953
+demo02: taps board == emulator; vs fp32 Pearson 0.865
+demo05: taps board == emulator; vs fp32 Pearson 0.743
+demo08: taps board == emulator; vs fp32 Pearson 0.676
+```
+
+The 80 s load is now paid once, and a picture costs 4.5 s, all of it the encoder. With
+no expected values in the program, the evidence of correctness is end to end: four
+taps per picture, byte-identical to the emulator at the same fixed scales. Any wrong op
+anywhere upstream would have shown in them.
+
+![input, fp32, FPGA per-image scales, FPGA one program](assets/results/fpga_depth_126_static.png)
+
+The street and the bicycle are as good as before or better: demo08's contrast is closer
+to fp32 than the per-image run, which over-stretched it. The sunflower horizon washes
+out. Five pictures cannot cover every scene, and a larger or domain-matched
+calibration set is the lever there.
+
+### 6.21 Remaining
 
 Only `verible-verilog-lint` is still missing, which makes `srcs.lint` unavailable. It is
 optional — a code-quality check, not a build step — so it is not blocking.
@@ -1435,11 +1495,10 @@ optional — a code-quality check, not a build step — so it is not blocking.
    traffic that is already comfortably underneath it. 32×32 takes compute to 0.91 s.
    DSP-mapped PEs come first — §6.13 leaves 51% of the LUTs free, which 1024 LUT-mapped
    MACs would not fit into, and 88% of the DSPs are idle.
-2. **The runtime**, continued from §6.19. The encoder runs and depth maps come out.
-   Next: split the blob into a resident weight image and a small per-image part (input,
-   arena, no expected results), so an image costs seconds rather than a 110 s load; then
-   the DPT head on the accelerator (60% of the MACs: convs as GEMMs over im2col), and
-   larger inputs.
+2. **The runtime**, continued from §6.20. One program serves any picture at 4.5 s.
+   Next: the DPT head on the accelerator (60% of the MACs: convs as GEMMs over im2col,
+   bilinear upsampling as a fixed-weight GEMM), so the host only writes the input and
+   reads the depth map; then larger inputs.
 3. **The result path.** 15% of the encoder is the CPU copying results out of the
    result region. The DMA writing back to DRAM removes it.
 4. **Throughput**, which §6.12 measured and §6.14 demoted: the engine's 44%, the DMA's

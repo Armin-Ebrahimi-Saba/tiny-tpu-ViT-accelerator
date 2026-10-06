@@ -23,7 +23,14 @@ def load_image(path: Path | str, size: int) -> np.ndarray:
     """
     from PIL import Image
 
-    img = Image.open(path).convert("RGB").resize((size, size), Image.BICUBIC)
+    if isinstance(path, str) and path.startswith("skimage:"):
+        # A named skimage sample (skimage:astronaut): held-out calibration
+        # pictures that need no download and are never evaluation images.
+        import skimage.data
+        img = Image.fromarray(getattr(skimage.data, path.split(":", 1)[1])())
+    else:
+        img = Image.open(path)
+    img = img.convert("RGB").resize((size, size), Image.BICUBIC)
     arr = np.asarray(img, dtype=np.float32) / 255.0
     arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
     return arr.transpose(2, 0, 1)[None].astype(np.float32)
