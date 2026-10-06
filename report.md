@@ -1386,20 +1386,27 @@ tap0/norm: board == emulator   (and tap1..tap3)
 | demo01, street | 0.955 | 17.9% | 84.9% |
 | demo02, sunflowers | 0.966 | 9.2% | 93.0% |
 | demo05, line drawing | 0.916 | 0.9% | 100% |
+| demo08, bicycle | 0.505 | 5.1% | 100% |
 
 \*After a least-squares scale and shift: DA-V2 predicts relative disparity, and pixels
-under 5% of the reference maximum (sky) are excluded. demo05's near-perfect ratio
-metrics come from an almost flat scene; its Pearson is the meaningful number.
+under 5% of the reference maximum (sky) are excluded. The ratio metrics flatter scenes
+with a narrow disparity range (demo05, demo08), so Pearson is the number to read.
+
+demo08 is where int8-everything visibly hurts. Its structure is all there: both
+wheels, the frame and the spokes. But the bicycle comes out much nearer than the
+background and the ground plane's gradient is flattened, which a per-pixel correlation
+punishes. The board equals the emulator on it too, so this is the quantization recipe
+and not the hardware.
 
 ![input, fp32 reference, FPGA](assets/results/fpga_depth_126.png)
 
 The maps are recognisably the scenes (sky far, road and cars near, the tower and the
 sunflowers picked out) and softer than fp32. That softness is the int8-everything
 quantization measured in §2, not the board: the board matches the emulator bit for bit.
-The fourth image, demo08, did not run. The FPGA lost its configuration twice within
-minutes (`bad id 0xaffe` after a successful program), and Vivado's `hw_server` kept the
-cable claimed once (`LIBUSB_ERROR_BUSY`). That is the board's power and the tooling, not
-the accelerator, and it is recorded in `CLAUDE.md`.
+demo08 took four attempts. The FPGA lost its configuration twice within minutes
+(`bad id 0xaffe` after a successful program), and Vivado's `hw_server` kept the cable
+claimed once (`LIBUSB_ERROR_BUSY`). That is the board's power and the tooling, not the
+accelerator, and both are recorded in `CLAUDE.md`.
 
 **Cost:** 219 M cycles per image, **4.4 s at 50 MHz** for the encoder (verification
 excluded), against §6.18's 0.36 s × 12 estimate:
