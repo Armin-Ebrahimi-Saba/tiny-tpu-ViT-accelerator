@@ -1483,7 +1483,68 @@ to fp32 than the per-image run, which over-stretched it. The sunflower horizon w
 out. Five pictures cannot cover every scene, and a larger or domain-matched
 calibration set is the lever there.
 
-### 6.21 Remaining
+### 6.21 Step 19 — the DPT head on the accelerator: the whole model on the board
+
+The head was 60% of the model's MACs at 518×518 and still ran in fp32 on the host.
+`sw/export_head.py` lowers it onto the same six ops, continuing the encoder's blob.
+Head tensors are `[H][W][C]` int8 in the arena: pixel-major, channels contiguous. That
+is what the encoder's tokens already are once the cls row is dropped, and what a GEMM
+wants when M is pixels.
+
+| op | lowering |
+|---|---|
+| conv k×k | A GEMM whose activation tiles the **driver gathers as im2col rows** straight into the activation buffer (descriptor v3 `g_*` fields). Unrolled into DMAs, the 126×126 3×3 conv alone would be 143,000 of them. The two 384-channel 3×3s have K = 3,456, deeper than the 3,072-word weight buffer, so they split by taps and sum with a qadd. |
+| conv-transpose (k = stride) | Outputs never overlap: one GEMM per output sub-row `dy`, `[HW][Ci]×[Ci][(dx, co)]`, and the pixel shuffle is a **two-level strided result copy**. |
+| bilinear (align_corners) | Separable. Width: per input row, a GEMM of a constant `[Wo][W]` int8 matrix whose rows sum to exactly 127, against the row's `[W][C]` as the weight operand. Rows past `W` meet zero columns. Height: per output row, a qadd of the two source rows with multipliers `1−t` and `t`. |
+| ReLU, residual add | The LUT unit, qadd. |
+
+Fed the fp32 graph's own taps, the lowering's float path matches the reference head to
+2×10⁻⁶. That checks the weight order, the transposed-conv layout and the upsampling
+(`test_export_head.py`, at a 4×4 grid). Its int8 path reaches Pearson 0.999 on the same
+taps, so the head quantizes far better than the encoder does. Three bugs surfaced on the
+way, all in the exporter:
+
+- A conv padded from 1 to 16 output channels gave its zero columns a 10⁻¹⁴ weight scale.
+- Sample positions a rounding error off a source row asked for a 10⁻¹⁶ multiplier.
+- `python -m sw.export_tpu` ran as `__main__`, a second copy of the module whose
+  calibration the head never saw.
+
+On the board, first fully checked (every op compared on the device), then as one program:
+
+```
+tinytpu: PASS blob -- 7631 ops, 0 failed                        (demo01, checked)
+downloaded 26613328 bytes in 91.486504s                         (program, once)
+run 0..3: PASS in 7.4 s wall
+tinytpu: cycles: dma 128643199 (66828112 bytes), gather 75164050, config 7564751,
+         engine 89890585, result copy 59624602
+demo01: taps+depth board == emulator; vs fp32 Pearson 0.953
+demo02: taps+depth board == emulator; vs fp32 Pearson 0.859
+demo05: taps+depth board == emulator; vs fp32 Pearson 0.692
+demo08: taps+depth board == emulator; vs fp32 Pearson 0.661
+```
+
+The host now writes 48.5 KB of input and reads 254 KB of depth; everything between runs
+on the FPGA. Per picture: 361 M cycles, **7.2 s** at 50 MHz.
+
+| | encoder | head | share |
+|---|---|---|---|
+| DMA | 113.8 M | 14.8 M | 36% |
+| engine (array + vector unit) | 67.8 M | 22.1 M | 25% |
+| im2col gather (CPU) | — | 75.2 M | 21% |
+| result copy (CPU) | 32.1 M | 27.5 M | 17% |
+| config | 6.4 M | 1.1 M | 2% |
+
+![input, fp32, encoder on the board with the head in fp32, the whole model on the board](assets/results/fpga_depth_126_full.png)
+
+**What the int8 head costs is visible, not measurable.** Pearson barely moves (0.791
+mean against 0.809 with the head in fp32), but the maps are posterized and speckled next to the encoder-only
+column. The head's output is an int8 channel: demo05 uses 24 distinct depth levels,
+demo08 42, demo01 109. A smooth gradient becomes contours, and conv2's noise at 126×126
+dithers them. The fix belongs in the last op, not the hardware: emit the final 1×1 conv
+at two scales (coarse and ×64 fine, saturating) and combine on read-back, or give that
+conv's requantizer a 16-bit output.
+
+### 6.22 Remaining
 
 Only `verible-verilog-lint` is still missing, which makes `srcs.lint` unavailable. It is
 optional — a code-quality check, not a build step — so it is not blocking.
@@ -1495,10 +1556,10 @@ optional — a code-quality check, not a build step — so it is not blocking.
    traffic that is already comfortably underneath it. 32×32 takes compute to 0.91 s.
    DSP-mapped PEs come first — §6.13 leaves 51% of the LUTs free, which 1024 LUT-mapped
    MACs would not fit into, and 88% of the DSPs are idle.
-2. **The runtime**, continued from §6.20. One program serves any picture at 4.5 s.
-   Next: the DPT head on the accelerator (60% of the MACs: convs as GEMMs over im2col,
-   bilinear upsampling as a fixed-weight GEMM), so the host only writes the input and
-   reads the depth map; then larger inputs.
+2. **The runtime**, continued from §6.21. The whole model runs on the board at 7.2 s
+   per picture. Next: a wider depth output (§6.21's posterization), then the CPU's
+   two costs, the im2col gather (21%) and the result copy (17%), which a gather-capable
+   DMA and a DMA write-back would remove; then larger inputs.
 3. **The result path.** 15% of the encoder is the CPU copying results out of the
    result region. The DMA writing back to DRAM removes it.
 4. **Throughput**, which §6.12 measured and §6.14 demoted: the engine's 44%, the DMA's

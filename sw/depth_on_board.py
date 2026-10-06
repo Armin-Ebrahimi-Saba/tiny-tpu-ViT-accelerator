@@ -9,10 +9,12 @@ address and scale. Per picture, this writes the im2col'd int8 input next to
 the picture's outputs, then runs them all in one board session -- the 30 MB
 blob is loaded once -- and for each picture:
 
-  - reads back the four taps the board left in DDR3,
+  - reads back what the board left in DDR3: the four taps, and the depth map
+    itself when the program carries the head (`--head`),
   - checks them byte for byte against the emulator at the same fixed scales,
-  - runs the DPT head in fp32 on the board's taps and writes the depth PNG
-    beside the fp32 reference, with the metrics between them.
+  - writes the depth PNG -- the board's own int8 map, or, for an encoder-only
+    program, the DPT head run in fp32 on the board's taps -- beside the fp32
+    reference, with the metrics between them.
 
     python -m sw.depth_on_board P.bin assets/examples/*.jpg --out results/
 """
@@ -76,22 +78,31 @@ def main() -> int:
     worst = 0
     for img, inp in zip(a.images, inputs):
         image = load_image(img, S)
-        emu = run_encoder_emulator(sd, image, scales)
+        has_head = "depth" in side
+        emu = run_encoder_emulator(sd, image, scales, head=has_head)
         board = {}
         for j, t in enumerate(side["taps"]):
             raw = np.fromfile(f"{inp}.tap{j}.bin", dtype=np.int8)[:t["bytes"]]
             board[t["name"]] = raw.reshape(t["shape"][1:])
+        if has_head:
+            d = side["depth"]
+            board["depth"] = np.fromfile(f"{inp}.depth.bin", dtype=np.int8)[:d["bytes"]].reshape(d["shape"])
         same = all(np.array_equal(board[k], emu[k]) for k in emu)
         worst |= 0 if same else 1
 
         ref = run_float(graph, {"image": image})[out_name].squeeze()
-        over = {t["name"]: board[t["name"]].astype(np.float32).reshape(t["shape"]) * t["scale"]
-                for t in side["taps"]}
-        depth = run_float(graph, {"image": image}, overrides=over)[out_name].squeeze()
+        if has_head:
+            # The board's own answer: channel 0 of the last conv, dequantized.
+            depth = board["depth"][..., 0].astype(np.float32) * side["depth"]["scale"]
+        else:
+            over = {t["name"]: board[t["name"]].astype(np.float32).reshape(t["shape"]) * t["scale"]
+                    for t in side["taps"]}
+            depth = run_float(graph, {"image": image}, overrides=over)[out_name].squeeze()
         save_depth_png(ref, a.out / f"{img.stem}.ref.png")
         save_depth_png(depth, a.out / f"{img.stem}.fpga.png")
         m = depth_metrics(ref, depth)
-        print(f"{img.stem}: taps board {'==' if same else '!='} emulator; vs fp32 Pearson "
+        what = "taps+depth" if has_head else "taps"
+        print(f"{img.stem}: {what} board {'==' if same else '!='} emulator; vs fp32 Pearson "
               f"{m['pearson']:.3f}, AbsRel {m['absrel'] * 100:.1f}%, delta<1.25 "
               f"{m['delta1'] * 100:.1f}%  -> {a.out / (img.stem + '.fpga.png')}")
     return worst

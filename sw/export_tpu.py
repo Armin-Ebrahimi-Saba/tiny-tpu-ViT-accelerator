@@ -46,6 +46,17 @@ Descriptor fields (each a u32):
     check_dram  expected int8 elements of the result, 0 = do not check
     check_n     how many elements
     name_off    offset of a NUL-terminated name, for the driver's messages
+    g_src       GEMM only: gather operand A as an im2col instead of DMA'ing
+                a_dram. g_src is an [H][W][C] int8 tensor in DRAM
+    g_hw        H | W << 16
+    g_cw        C (bytes per pixel, a multiple of 16) | Wo << 16
+    g_k         k | stride << 8 | pad << 16 | t0 << 20 | t1 << 26: kernel
+                taps t0..t1-1 of the k*k, row-major, each C bytes in a row
+    g_p0        first output pixel of this m tile (raster order over Wo)
+    out_grp     result rows come in groups of this many (0 = one group);
+    out_grp_stride  bytes between groups' first rows in DRAM -- a strided
+                copy one level deeper, for a transposed conv's pixel shuffle
+    pad
 
 Config-region layout is the driver's (main.c): per-channel GEMM constants at
 word 4*c + {0 bias, 1 mult, 2 shift}; layernorm gamma/beta pairs at
@@ -70,7 +81,7 @@ from .numerics import INT8_MAX, INT8_MIN, Requant
 from .tiling import LANES, Buffers, tile_gemm
 
 MAGIC = b"TPU1"
-VERSION = 2
+VERSION = 3
 
 TPU_BLOB_ADDR = 0x8000_0000
 
@@ -94,11 +105,12 @@ VEC_SHIFT_B_LSB = 8
 # The RTL's buffers (tinytpu.sv). sw/tiling.py sized these.
 BUFFERS = Buffers(act_words=512, wgt_words=3072, out_words=512)
 
-DESC_WORDS = 24
+DESC_WORDS = 32
 DESC_FIELDS = ("op", "a_dram", "a_words", "b_dram", "b_words", "src_a", "src_b",
                "dst", "shape", "cfg_dram", "cfg_dst", "cfg_n", "vmult", "vmult_b",
                "vshift", "eps_lo", "eps_hi", "out_dram", "out_cols", "out_rows",
-               "out_stride", "check_dram", "check_n", "name_off")
+               "out_stride", "check_dram", "check_n", "name_off",
+               "g_src", "g_hw", "g_cw", "g_k", "g_p0", "out_grp", "out_grp_stride", "pad")
 HEADER_BYTES = 64
 
 # A data handle is a chunk index; an arena handle has this bit set.
@@ -201,10 +213,18 @@ class Desc:
     check_dram: int = 0
     check_n: int = 0
     name_off: int = 0
+    g_src: int = 0
+    g_hw: int = 0
+    g_cw: int = 0
+    g_k: int = 0
+    g_p0: int = 0
+    out_grp: int = 0
+    out_grp_stride: int = 0
+    pad: int = 0
 
     def pack(self) -> bytes:
         vals = [getattr(self, f) & 0xFFFFFFFF for f in DESC_FIELDS]
-        return struct.pack("<24I", *vals)
+        return struct.pack(f"<{DESC_WORDS}I", *vals)
 
 
 @dataclass
@@ -325,7 +345,9 @@ def _requant_slice(rq: Requant, n0: int, n1: int) -> Requant:
 def emit_gemm(blob: Blob, name: str, x_q: np.ndarray, x_ref: Ref | None,
               w_q: np.ndarray, bias_q: np.ndarray, rq: Requant,
               w_ref: Ref | None = None, out_ref: Ref | None = None,
-              out_stride: int | None = None, check: bool = True) -> np.ndarray:
+              out_stride: int | None = None, check: bool = True,
+              gather: dict | None = None, out_grp: int = 0, out_grp_stride: int = 0,
+              m_align: int = 1) -> np.ndarray:
     """`y = requant(x_q @ w_q + bias)` as the tiles gemm_seq can run.
 
     x_q is [M][K] int8 row-major -- the activation buffer's layout, so an m
@@ -354,12 +376,16 @@ def emit_gemm(blob: Blob, name: str, x_q: np.ndarray, x_ref: Ref | None,
     t = tile_gemm(name, m, k, n, BUFFERS)
     if not t.fits:
         raise ValueError(f"{name}: {t.reason}")
+    m_tile = t.m_tile
+    if m_align > 1 and m_tile < m:
+        m_tile = m_tile // m_align * m_align
+        assert m_tile > 0, f"{name}: an m tile cannot hold one group of {m_align} rows"
     if w_ref is not None and t.n_tile < n:
         raise ValueError(f"{name}: an operand already in DRAM cannot be split into n tiles")
     stride = n if out_stride is None else out_stride
 
     y_q = qlinear(x_q, w_q.T, bias_q.astype(np.int32), rq)
-    if x_ref is None:
+    if x_ref is None and gather is None:
         x_ref = blob.data(x_q)
     k_words = k // LANES
 
@@ -368,13 +394,23 @@ def emit_gemm(blob: Blob, name: str, x_q: np.ndarray, x_ref: Ref | None,
         w_h = w_ref if w_ref is not None else blob.data(np.ascontiguousarray(w_q[:, n0:n0 + nt]))
         cfg_h = blob.data(per_channel_config(bias_q[n0:n0 + nt], _requant_slice(rq, n0, n0 + nt), nt))
 
-        for i, m0 in enumerate(range(0, m, t.m_tile)):
-            mt = min(t.m_tile, m - m0)
+        for i, m0 in enumerate(range(0, m, m_tile)):
+            mt = min(m_tile, m - m0)
             d = Desc(op=OP_GEMM, name=f"{name}[{m0}:{m0 + mt},{n0}:{n0 + nt}]",
                      a_words=mt * k_words,
                      src_a=src(R_ACT, 0), src_b=src(R_WGT, 0), dst=0,
                      shape=gemm_shape(mt, k_words, nt // LANES))
-            refs: dict[str, Ref] = {"a_dram": ref_add(x_ref, m0 * k)}
+            if gather is None:
+                refs: dict[str, Ref] = {"a_dram": ref_add(x_ref, m0 * k)}
+            else:
+                # The driver builds this tile's im2col rows in the buffer itself.
+                g = gather
+                d.a_words = 0
+                d.g_hw = g["H"] | g["W"] << 16
+                d.g_cw = g["C"] | g["Wo"] << 16
+                d.g_k = g["k"] | g["stride"] << 8 | g["pad"] << 16 | g["t0"] << 20 | g["t1"] << 26
+                d.g_p0 = m0
+                refs = {"g_src": g["src"]}
             if i == 0:
                 d.b_words = k * (nt // LANES)
                 refs["b_dram"] = w_h
@@ -382,7 +418,12 @@ def emit_gemm(blob: Blob, name: str, x_q: np.ndarray, x_ref: Ref | None,
                 refs["cfg_dram"] = cfg_h
             if out_ref is not None:
                 d.out_cols, d.out_rows, d.out_stride = nt, mt, stride
-                refs["out_dram"] = ref_add(out_ref, m0 * stride + n0)
+                if out_grp:
+                    assert m0 % out_grp == 0
+                    d.out_grp, d.out_grp_stride = out_grp, out_grp_stride
+                    refs["out_dram"] = ref_add(out_ref, (m0 // out_grp) * out_grp_stride + n0)
+                else:
+                    refs["out_dram"] = ref_add(out_ref, m0 * stride + n0)
             if check:
                 exp = np.ascontiguousarray(y_q[m0:m0 + mt, n0:n0 + nt])
                 d.check_n = exp.size
@@ -536,7 +577,7 @@ def build_gemm_probe(blob: Blob, sd: dict[str, np.ndarray], tokens: int, seed: i
 
 
 def linear_q(key: str, x_f: np.ndarray, s_x: float, w_f: np.ndarray, b_f: np.ndarray,
-             per_chan: np.ndarray | None = None):
+             per_chan: np.ndarray | None = None, s_y: float | None = None):
     """Quantize a [K][N] weight per output channel and derive the requant for
     the float output's own scale. `per_chan` (LayerScale) folds into the
     multiplier -- its sign into the weight column, since the requantizer's
@@ -545,13 +586,19 @@ def linear_q(key: str, x_f: np.ndarray, s_x: float, w_f: np.ndarray, b_f: np.nda
         sign = np.where(per_chan < 0, -1.0, 1.0)
         w_f, b_f = w_f * sign, b_f * sign
         per_chan = np.maximum(np.abs(per_chan), 1e-12)
-    s_w = np.maximum(np.abs(w_f).max(axis=0), 1e-12) / INT8_MAX
+    # An all-zero column (an output channel padded to a whole word) takes the
+    # layer's widest scale: its output is 0 whatever the multiplier, and a
+    # 1e-12 scale would need a shift the requantizer does not have.
+    amax = np.abs(w_f).max(axis=0)
+    amax = np.where(amax > 0, amax, max(float(amax.max()), 1e-12))
+    s_w = amax / INT8_MAX
     w_q = quant(w_f, s_w)
     b_q = np.rint(b_f / (s_x * s_w)).astype(np.int64)
     y_f = x_f @ w_f + b_f
     if per_chan is not None:
         y_f = y_f * per_chan
-    s_y = act_scale(key, y_f)
+    if s_y is None:
+        s_y = act_scale(key, y_f)
     real = s_x * s_w / s_y
     if per_chan is not None:
         real = real * per_chan
@@ -737,7 +784,8 @@ def encoder_input(image: np.ndarray, scale: float) -> np.ndarray:
 
 def build_encoder(blob: Blob, sd: dict[str, np.ndarray], image: np.ndarray,
                   check: bool = True, taps: tuple[int, ...] = (2, 5, 8, 11),
-                  dump: list[str] = (), input_in_arena: bool = False) -> dict:
+                  dump: list[str] = (), input_in_arena: bool = False,
+                  head: bool = False) -> dict:
     """Increment 3: the whole ViT-S encoder over a preprocessed [1][3][S][S]
     image, S a multiple of 14. Returns the sidecar the host needs to finish
     the picture: where each tap's normalized tokens are, and their scales.
@@ -812,10 +860,17 @@ def build_encoder(blob: Blob, sd: dict[str, np.ndarray], image: np.ndarray,
             if i in taps:
                 j = len(side["taps"])
                 t_ref = blob.scratch(T * E)
-                t_q, s_t, _ = emit_layernorm(blob, f"tap{j}.norm", x_q, x_ref, s_x, x_f,
-                                             f64("norm.weight"), f64("norm.bias"), t_ref, check=check)
+                t_q, s_t, t_f = emit_layernorm(blob, f"tap{j}.norm", x_q, x_ref, s_x, x_f,
+                                               f64("norm.weight"), f64("norm.bias"), t_ref,
+                                               check=check)
                 side["taps"].append({"name": f"tap{j}/norm", "block": i, "ref": t_ref,
-                                     "scale": float(s_t), "shape": [1, T, E], "emu": t_q})
+                                     "scale": float(s_t), "shape": [1, T, E], "emu": t_q,
+                                     "f": t_f})
+        if head:
+            from .export_head import build_head
+            side["depth"] = build_head(blob, sd, [{"q": t["emu"], "ref": t["ref"], "s": t["scale"],
+                                                   "f": t["f"]} for t in side["taps"]],
+                                       g, S, check=check)
     finally:
         emit_layernorm = plain
     return side
@@ -837,7 +892,7 @@ def calibrate(sd: dict[str, np.ndarray], images, size: int, percentile: float) -
     saved, CALIB = CALIB, Calibration(percentile=percentile)
     try:
         for img in images:
-            build_encoder(Blob(), sd, load_image(str(img), size), check=False)
+            build_encoder(Blob(), sd, load_image(str(img), size), check=False, head=True)
         rec = CALIB
     finally:
         CALIB = saved
@@ -846,15 +901,20 @@ def calibrate(sd: dict[str, np.ndarray], images, size: int, percentile: float) -
 
 
 def run_encoder_emulator(sd: dict[str, np.ndarray], image: np.ndarray, scales: dict[str, float],
-                         taps: tuple[int, ...] = (2, 5, 8, 11)) -> dict[str, np.ndarray]:
-    """What a fixed-scale program computes for `image`: the taps, bit-exact."""
+                         taps: tuple[int, ...] = (2, 5, 8, 11),
+                         head: bool = False) -> dict[str, np.ndarray]:
+    """What a fixed-scale program computes for `image`, bit-exact: the taps,
+    and with `head` the int8 depth map ([S][S][16], channel 0 is depth)."""
     global CALIB
     saved, CALIB = CALIB, Calibration(fixed=scales)
     try:
-        side = build_encoder(Blob(), sd, image, check=False, taps=taps)
+        side = build_encoder(Blob(), sd, image, check=False, taps=taps, head=head)
     finally:
         CALIB = saved
-    return {t["name"]: t["emu"] for t in side["taps"]}
+    out = {t["name"]: t["emu"] for t in side["taps"]}
+    if head:
+        out["depth"] = side["depth"]["emu"]
+    return out
 
 
 def main() -> None:
@@ -875,6 +935,8 @@ def main() -> None:
     ap.add_argument("--percentile", type=float, default=100.0)
     ap.add_argument("--calib", type=Path, default=None,
                     help="encoder: fixed scales from --calibrate instead of the image's own")
+    ap.add_argument("--head", action="store_true",
+                    help="encoder: run the DPT head on the accelerator too; the blob ends in a depth map")
     ap.add_argument("--program-only", action="store_true",
                     help="encoder: image-independent program; the host writes each input (needs --calib)")
     a = ap.parse_args()
@@ -907,14 +969,19 @@ def main() -> None:
         else:
             image = synthetic_image(a.size, np.random.default_rng(a.seed))
         side = build_encoder(blob, sd, image, check=not (a.no_check or a.program_only),
-                             dump=a.dump, input_in_arena=a.program_only)
+                             dump=a.dump, input_in_arena=a.program_only, head=a.head)
     total = blob.write(a.o)
     if a.program == "encoder":
         # The sidecar: what the host needs to read the taps back and finish
         # the picture. The emulator's own taps ride along as .npz so the
         # board's can be compared to them byte for byte.
         emu = {}
-        for t in side["taps"] + side["dumps"] + ([side["input"]] if "input" in side else []):
+        for t in side["taps"]:
+            t.pop("f", None)
+        if "depth" in side:
+            side["depth"].pop("f")
+        for t in (side["taps"] + side["dumps"] + ([side["input"]] if "input" in side else [])
+                  + ([side["depth"]] if "depth" in side else [])):
             t["addr"] = blob.address(t.pop("ref"))
             t["bytes"] = int(np.prod(t["shape"]))
             emu[t["name"]] = t.pop("emu")
@@ -929,4 +996,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Run as the canonical module, not as __main__: export_head imports
+    # sw.export_tpu, and the calibration state must be the one it sees.
+    from sw import export_tpu as _canonical
+    _canonical.main()
