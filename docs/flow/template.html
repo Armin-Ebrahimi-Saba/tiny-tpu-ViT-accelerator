@@ -1,0 +1,225 @@
+<title>Depth on tiny-tpu</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: one reading column; figures break out wider and scroll on their own when narrow.
+   Each place where work happens has one colour, used for lanes, arrows, chips and bars alike. */
+:root {
+  --bg: #f4f5f2; --surface: #ffffff; --fg: #1c2124; --muted: #5d666b; --rule: #d5d9d4; --band: #eceee9;
+  --host: #4f5b66; --cpu: #a86a12; --dma: #0f7f72; --arr: #2c5cc5; --vec: #8445bd; --mem: #5f6f43;
+  --display: "IBM Plex Sans Condensed", "Arial Narrow", sans-serif;
+  --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15191b; --surface: #1d2225; --fg: #e3e7e5; --muted: #9aa3a6; --rule: #343b3f; --band: #1a1f21;
+    --host: #9fb0bf; --cpu: #e3a446; --dma: #3cc2b0; --arr: #7aa2ff; --vec: #c18cf2; --mem: #a9bb83;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15191b; --surface: #1d2225; --fg: #e3e7e5; --muted: #9aa3a6; --rule: #343b3f; --band: #1a1f21;
+  --host: #9fb0bf; --cpu: #e3a446; --dma: #3cc2b0; --arr: #7aa2ff; --vec: #c18cf2; --mem: #a9bb83;
+  color-scheme: dark;
+}
+body { background: var(--bg); color: var(--fg); font: 15px/1.55 var(--body); }
+main { max-width: 1060px; margin: 0 auto; padding-inline: 20px; padding-block: 36px 64px;
+       display: grid; gap: 44px; }
+.prose { max-width: 68ch; }
+h1, h2 { font-family: var(--display); font-weight: 600; text-wrap: balance; margin: 0; }
+h1 { font-size: 2.3rem; line-height: 1.1; letter-spacing: -0.01em; }
+h2 { font-size: 1.35rem; margin-bottom: 6px; }
+p { margin: 0; }
+.prose p + p { margin-top: 10px; }
+.muted { color: var(--muted); }
+code, .mono { font-family: var(--mono); font-size: 0.88em; }
+
+header { display: grid; gap: 18px; }
+.hero { display: flex; flex-wrap: wrap; align-items: center; gap: 18px 22px; }
+.hero figure { margin: 0; display: grid; gap: 6px; justify-items: center; }
+.hero img { width: 168px; height: 168px; image-rendering: auto; border-radius: 3px; display: block; }
+.hero figcaption { font: 12px var(--mono); color: var(--muted); }
+.hero .via { font: 13px var(--mono); color: var(--muted); display: grid; gap: 2px; justify-items: center; }
+.hero .via b { color: var(--fg); font-weight: 500; font-size: 15px; }
+.hero .via .bar { width: 120px; height: 2px; background: var(--fg); position: relative; }
+.hero .via .bar::after { content: ""; position: absolute; right: -1px; top: -4px; border: 5px solid transparent; border-left: 7px solid var(--fg); border-right: 0; }
+
+.key { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 13px; }
+.key span { display: inline-flex; align-items: center; gap: 7px; }
+.key i { width: 14px; height: 4px; border-radius: 2px; display: inline-block; }
+
+.fig { margin: 0; display: grid; gap: 10px; }
+.scroll { overflow-x: auto; background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 10px 6px; }
+.scroll svg { display: block; width: 100%; min-width: 820px; height: auto; color: var(--fg); }
+.scroll.bars svg { min-width: 640px; }
+figcaption.cap { font-size: 13.5px; color: var(--muted); max-width: 78ch; }
+
+/* swimlane */
+.life { stroke: var(--rule); stroke-width: 1.5; }
+.band { fill: var(--band); }
+.band-t, .loop-t { font: 600 10.5px var(--mono); letter-spacing: 0.08em; fill: var(--muted); }
+.loop { fill: none; stroke: var(--muted); stroke-width: 1; stroke-dasharray: 2 3; }
+.head { fill: var(--surface); stroke-width: 1.5; }
+.hlbl { font: 600 13px var(--display); fill: var(--fg); }
+.hsub { font: 10.5px var(--mono); fill: var(--muted); }
+.e { stroke-width: 2; fill: none; }
+.elbl { font: 500 12px var(--body); }
+.sub { font: 10.5px var(--mono); fill: var(--muted); }
+.note { fill: var(--surface); stroke-width: 1.2; }
+.nlbl { font: 500 11.5px var(--mono); fill: var(--fg); }
+.nsub { font: 10.5px var(--mono); fill: var(--muted); }
+.lbl { font: 12px var(--body); fill: var(--fg); }
+.host { stroke: var(--host); } .host-t, .host-f { fill: var(--host); } .host-h, .host-n { stroke: var(--host); }
+.cpu  { stroke: var(--cpu); }  .cpu-t, .cpu-f { fill: var(--cpu); }   .cpu-h, .cpu-n { stroke: var(--cpu); }
+.dma  { stroke: var(--dma); }  .dma-t, .dma-f { fill: var(--dma); }   .dma-h { stroke: var(--dma); }
+.arr  { stroke: var(--arr); }  .arr-t, .arr-f { fill: var(--arr); }   .arr-h { stroke: var(--arr); }
+.vec  { stroke: var(--vec); }  .vec-t, .vec-f { fill: var(--vec); }   .vec-h { stroke: var(--vec); }
+.ddr-h, .buf-h { stroke: var(--mem); }
+
+/* bars */
+.seg { stroke: var(--surface); stroke-width: 1; }
+.dma-s { fill: var(--dma); } .arr-s { fill: var(--arr); } .cpu-s { fill: var(--cpu); }
+.cpu-g-s { fill: var(--cpu); fill-opacity: 0.55; }
+.segl { font: 500 11px var(--mono); fill: var(--surface); }
+.blbl { font: 600 13px var(--display); fill: var(--fg); }
+.btot { font: 11px var(--mono); fill: var(--muted); }
+.tick { font: 10.5px var(--mono); fill: var(--muted); }
+.grid { stroke: var(--rule); stroke-width: 1; }
+
+/* stage table */
+.stages { width: 100%; min-width: 860px; border-collapse: collapse; font-size: 13px; }
+.stages th { font: 600 11px var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted);
+             text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+.stages td { padding: 9px 10px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+.stages td:first-child { font-weight: 600; white-space: nowrap; }
+.stages td.shape { font: 12px var(--mono); color: var(--muted); white-space: nowrap; }
+.stages tr.group td { background: var(--band); font: 600 11px var(--mono); letter-spacing: 0.07em; color: var(--muted); padding-block: 6px; }
+.stages td.on { position: relative; padding-left: 16px; }
+.stages td.on::before { content: ""; position: absolute; left: 6px; top: 11px; bottom: 11px; width: 3px; border-radius: 2px; }
+.stages td.host::before { background: var(--host); } .stages td.cpu::before { background: var(--cpu); }
+.stages td.dma::before { background: var(--dma); } .stages td.arr::before { background: var(--arr); }
+.stages td.vec::before { background: var(--vec); }
+.stages td.off { color: var(--rule); }
+.scroll.table { padding: 0; }
+
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px 28px; }
+.facts div { display: grid; gap: 2px; min-width: 0; }
+.facts dt { font: 11px var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.facts dd { margin: 0; font-size: 14px; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<main>
+<header>
+  <h1>Depth on tiny-tpu</h1>
+  <p class="prose">Depth Anything V2 Small, the whole network, on a Nexys Video FPGA. The PC only prepares the picture
+  and reads the answer back. Everything between runs on the board, every result is byte-identical to the Python emulator,
+  and it takes 7.4 s per 126×126 picture.</p>
+  <div class="hero" aria-label="demo01 street photo in, depth map out">
+    <figure><img src="{{IMG_IN}}" alt="Street scene, 126 by 126 pixels"><figcaption>demo01, 126×126</figcaption></figure>
+    <div class="via"><b>7,631 ops</b><span class="bar"></span><span>on the FPGA · 7.4 s</span></div>
+    <figure><img src="{{IMG_OUT}}" alt="Depth map read back from the board: near is bright, sky is dark"><figcaption>depth read back from DDR3</figcaption></figure>
+  </div>
+  <div class="key" aria-label="Colour key">
+    <span><i style="background:var(--host)"></i>Host PC and the JTAG link</span>
+    <span><i style="background:var(--cpu)"></i>CV32E40P CPU</span>
+    <span><i style="background:var(--dma)"></i>DMA engine</span>
+    <span><i style="background:var(--arr)"></i>16×16 systolic array</span>
+    <span><i style="background:var(--vec)"></i>Vector unit</span>
+    <span><i style="background:var(--mem)"></i>Memory</span>
+  </div>
+</header>
+
+<section class="fig">
+  <div class="prose">
+    <h2>Who moves which bytes</h2>
+    <p>Time runs downward. Each vertical line is a place on the board or the PC; an arrow is data moving between two
+    of them, coloured by what drives the move. The program is loaded once. After that, a picture costs the 48.5 KB
+    input in, one pass over the descriptor list, and the 254 KB depth map out.</p>
+  </div>
+  <div class="scroll">{{SWIM}}</div>
+  <figcaption class="cap">Inside the loop the units take turns: the CPU reads a descriptor, the DMA (or, for the head's
+  convolutions, the CPU) fills the buffers, the array or the vector unit computes into OUT, and the CPU copies OUT back to
+  DDR3. Percentages are each step's share of the 361 M cycles one picture takes. Nothing overlaps yet, which is why
+  the array is busy only a quarter of the time.</figcaption>
+</section>
+
+<section class="fig">
+  <div class="prose">
+    <h2>What runs where, stage by stage</h2>
+    <p>The network from input to depth. A marked cell means that unit does work in that stage; the counts are hardware
+    ops in the program.</p>
+  </div>
+  <div class="scroll table">
+  <table class="stages">
+    <thead><tr><th>Stage</th><th>Tensor out</th><th>Host PC</th><th>CPU</th><th>DMA</th><th>Array</th><th>Vector unit</th></tr></thead>
+    <tbody>
+      <tr class="group"><td colspan="7">BEFORE THE RUN</td></tr>
+      <tr><td>Prepare input</td><td class="shape">82 × 592 int8</td>
+        <td class="on host">Resize to 126², normalise, cut 81 patches of 14×14×3 into rows, int8; write 48.5 KB over JTAG</td>
+        <td class="off">·</td><td class="off">·</td><td class="off">·</td><td class="off">·</td></tr>
+      <tr class="group"><td colspan="7">ENCODER · 4,759 OPS · 220 M CYCLES</td></tr>
+      <tr><td>Patch embedding</td><td class="shape">82 × 384</td><td class="off">·</td>
+        <td class="on cpu">Copy results to the arena</td><td class="on dma">Patch rows, 592×384 weight</td>
+        <td class="on arr">35 GEMM tiles</td><td class="off">·</td></tr>
+      <tr><td>cls + position</td><td class="shape">82 × 384</td><td class="off">·</td><td class="off">·</td>
+        <td class="on dma">Tokens, the constant</td><td class="off">·</td><td class="on vec">4 qadd</td></tr>
+      <tr><td>Blocks 1–12</td><td class="shape">82 × 384</td><td class="off">·</td>
+        <td class="on cpu">7 table loads per block (6 exp, 1 GELU); result copies</td>
+        <td class="on dma">1.8 MB weights per block; activations from the arena</td>
+        <td class="on arr">348 tiles per block: q, k, v for 6 heads, QKᵀ, P·V, proj, fc1, fc2</td>
+        <td class="on vec">Per block: 8 layernorm, 6 Kᵀ transposes, 6 softmax, 16 GELU, 8 residual qadd</td></tr>
+      <tr><td>Four taps</td><td class="shape">4 × 82 × 384</td><td class="off">·</td><td class="off">·</td>
+        <td class="on dma">Block outputs 3, 6, 9, 12</td><td class="off">·</td><td class="on vec">16 layernorm</td></tr>
+      <tr class="group"><td colspan="7">DPT HEAD · 2,872 OPS · 141 M CYCLES</td></tr>
+      <tr><td>Reassemble</td><td class="shape">36²×48 · 18²×96<br>9²×192 · 5²×384</td><td class="off">·</td>
+        <td class="on cpu">im2col gather for the stride-2 3×3; pixel-shuffle copy</td>
+        <td class="on dma">Taps without the cls row; weights</td>
+        <td class="on arr">1×1 projections; transposed convs, one GEMM per output sub-row</td>
+        <td class="on vec">qadd joining the halves of the 3,456-deep conv</td></tr>
+      <tr><td>rn convs 3×3</td><td class="shape">4 maps × 64</td><td class="off">·</td>
+        <td class="on cpu">im2col gather</td><td class="on dma">Weights</td><td class="on arr">Conv tiles</td>
+        <td class="on vec">qadd for the 384-channel split</td></tr>
+      <tr><td>Fusion ×4</td><td class="shape">5 → 9 → 18 → 36 → 72</td><td class="off">·</td>
+        <td class="on cpu">im2col gather for 14 residual-unit convs</td><td class="on dma">Weights, upsample rows</td>
+        <td class="on arr">Conv tiles; width-upsample GEMMs; 1×1 out convs</td>
+        <td class="on vec">ReLU, residual qadd, height-upsample qadd per row</td></tr>
+      <tr><td>Output convs</td><td class="shape">72²×32 → 126²×1</td><td class="off">·</td>
+        <td class="on cpu">im2col gather (the 126×126 conv: 567 tiles)</td><td class="on dma">Weights, upsample rows</td>
+        <td class="on arr">conv1, upsample to 126, conv2, conv3</td><td class="on vec">ReLU ×2, height upsample</td></tr>
+      <tr class="group"><td colspan="7">AFTER THE RUN</td></tr>
+      <tr><td>Read back</td><td class="shape">126 × 126 int8</td>
+        <td class="on host">Read 254 KB over JTAG, multiply by the output scale, write the PNG; compare to the emulator</td>
+        <td class="off">·</td><td class="off">·</td><td class="off">·</td><td class="off">·</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <figcaption class="cap">Totals: 6,616 GEMM ops on the array (2,181 of them with CPU-gathered activations), 1,015 ops
+  on the vector unit, 85 table loads by the CPU. Every op reads its operands from DDR3 and writes its result back, so
+  stages hand data to each other through the 13.8 MB arena and never through the buffers.</figcaption>
+</section>
+
+<section class="fig">
+  <div class="prose">
+    <h2>Where the 7.2 seconds go</h2>
+    <p>Measured on the board with <code>mcycle</code> at 50 MHz, per picture. The encoder is limited by the DMA; the head
+    by the CPU building im2col rows one 32-bit word at a time.</p>
+  </div>
+  <div class="scroll bars">{{BARS}}</div>
+  <figcaption class="cap">The array and vector unit are a quarter of the time. The rest is moving data, and 39% of it
+  passes through the CPU (gather, result copy, config). A DMA that could gather and write back would remove that share.</figcaption>
+</section>
+
+<section class="prose">
+  <h2>Where things live</h2>
+  <dl class="facts">
+    <div><dt>Program</dt><dd>26.6 MB in DDR3 at <span class="mono">0x8000_0000</span>: 7,717 descriptors, int8 weights, per-channel constants</dd></div>
+    <div><dt>Arena</dt><dd>13.8 MB directly above the program: every activation, the input, the depth map</dd></div>
+    <div><dt>On-chip buffers</dt><dd>ACT 8 KB, WGT 48 KB, OUT 8 KB, plus the config region; 115 BRAM tiles</dd></div>
+    <div><dt>Driver</dt><dd><span class="mono">tpu_runtime.c</span> on the CV32E40P, from BRAM; it interprets descriptors and decides nothing</dd></div>
+    <div><dt>Decisions</dt><dd><span class="mono">sw/export_tpu.py</span> on the PC: tiling, layouts, scales from 5 calibration photos</dd></div>
+    <div><dt>Link</dt><dd>USB JTAG through OpenOCD, about 284 KiB/s: 91 s for the program, once</dd></div>
+  </dl>
+</section>
+</main>
