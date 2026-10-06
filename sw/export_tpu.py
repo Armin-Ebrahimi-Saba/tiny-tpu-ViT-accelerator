@@ -187,6 +187,7 @@ class Blob:
     _refs: list[tuple[int, str, int, int]] = field(default_factory=list)  # (desc, field, handle, +bytes)
     _arena_off: list[int] = field(default_factory=list)
     _arena_len: int = 0
+    _layout: tuple[int, int] | None = None     # (data_off, total) once written
 
     def data(self, raw: bytes | np.ndarray) -> int:
         """Append bytes, 16-byte aligned so the DMA can start on them. Returns a handle."""
@@ -253,7 +254,13 @@ class Blob:
             out += c
         assert len(out) == total
         path.write_bytes(out)
+        self._layout = (data_off, total)
         return total
+
+    def address(self, ref: Ref) -> int:
+        """The DRAM address a ref resolved to. Valid after write()."""
+        assert self._layout is not None, "address() before write()"
+        return self.resolve(ref, *self._layout)
 
 
 # --------------------------------------------------------------------- GEMMs
@@ -514,7 +521,7 @@ def linear_q(x_f: np.ndarray, s_x: float, w_f: np.ndarray, b_f: np.ndarray,
 
 def build_block(blob: Blob, sd: dict[str, np.ndarray], tokens: int, seed: int,
                 blk: int = 0, x_f: np.ndarray | None = None, x_ref: Ref | None = None,
-                s_x: float | None = None, check: bool = True):
+                s_x: float | None = None, x_q: np.ndarray | None = None, check: bool = True):
     """Increment 2: one transformer block of the real model, at real width,
     activations living in the DDR3 arena between ops.
 
@@ -542,8 +549,10 @@ def build_block(blob: Blob, sd: dict[str, np.ndarray], tokens: int, seed: int,
         x_q = quant(x_f, s_x)
         x_ref = blob.data(x_q)
     else:
-        assert x_ref is not None and s_x is not None
-        x_q = quant(x_f, s_x)
+        # The integer tensor the previous op produced, not a re-quantization
+        # of the float one: the two differ by an LSB here and there, and the
+        # hardware only ever sees the former.
+        assert x_ref is not None and s_x is not None and x_q is not None
     nm = f"blk{blk}."
 
     # -- norm1 -> q, k, v per head, each a contiguous [T][D] --------------
@@ -667,14 +676,103 @@ def build_block(blob: Blob, sd: dict[str, np.ndarray], tokens: int, seed: int,
     return y_q, y_ref, s_y, y_f
 
 
+def build_encoder(blob: Blob, sd: dict[str, np.ndarray], image: np.ndarray,
+                  check: bool = True, taps: tuple[int, ...] = (2, 5, 8, 11),
+                  dump: list[str] = ()) -> dict:
+    """Increment 3: the whole ViT-S encoder over a preprocessed [1][3][S][S]
+    image, S a multiple of 14. Returns the sidecar the host needs to finish
+    the picture: where each tap's normalized tokens are, and their scales.
+
+    Patch embedding is the 14x14 stride-14 convolution as a GEMM over an
+    im2col the host does -- every patch is a row of 3*14*14 = 588 pixels,
+    padded to 592 -- with row 0 all zeros for the cls token, so the GEMM
+    gives it the bias alone. One qadd then adds a constant that is the
+    position embedding for every patch and (cls + pos[0] - bias) for row 0,
+    which is the cls token and its position in one op.
+
+    DINOv2 resamples the position grid bicubically for a non-518 input; the
+    frontend's _resample_pos_embed does that in float here.
+    """
+    from .frontend.dav2 import DAV2Config, _resample_pos_embed
+    E, P = 384, 14
+    _, C, S, S2 = image.shape
+    assert S == S2 and S % P == 0
+    g = S // P
+    T = g * g + 1
+    cfg = DAV2Config(img_size=S)
+    f64 = lambda k: sd["pretrained." + k].astype(np.float64)  # noqa: E731
+
+    # -- im2col, (c, kh, kw) order to match the weight's flattening ------
+    x = image[0].astype(np.float64)
+    patches = x.reshape(C, g, P, g, P).transpose(1, 3, 0, 2, 4).reshape(g * g, C * P * P)
+    K = (C * P * P + LANES - 1) // LANES * LANES
+    a_f = np.zeros((T, K))
+    a_f[1:, :C * P * P] = patches
+    s_a = qscale(a_f)
+    a_q = quant(a_f, s_a)
+    a_ref = blob.data(a_q)
+
+    w_f = np.zeros((K, E))
+    w_f[:C * P * P, :] = f64("patch_embed.proj.weight").reshape(E, -1).T
+    b_f = f64("patch_embed.proj.bias")
+    w_q, b_q, rq, tok_f, s_tok = linear_q(a_f, s_a, w_f, b_f)
+    tok_ref = blob.scratch(T * E)
+    tok_q = emit_gemm(blob, "embed", a_q, a_ref, w_q, b_q, rq, out_ref=tok_ref, check=check)
+
+    pos = _resample_pos_embed(sd["pretrained.pos_embed"], cfg)[0].astype(np.float64)   # [T][E]
+    const_f = pos.copy()
+    const_f[0] += f64("cls_token")[0, 0] - b_f
+    s_const = qscale(const_f)
+    const_q = quant(const_f, s_const)
+    x_f = tok_f + const_f
+    s_x = qscale(x_f)
+    x_ref = blob.scratch(T * E)
+    x_q = emit_qadd(blob, "tokens", tok_q, tok_ref, s_tok, const_q, blob.data(const_q), s_const,
+                    s_x, x_ref, check=check)
+
+    # -- twelve blocks, four taps through the final norm ------------------
+    side = {"image": S, "tokens": T, "taps": [], "dumps": []}
+    # Debugging: record the input and output of the layernorms named in
+    # `dump` so load_model.py reads them back in the run's own session.
+    global emit_layernorm
+    plain = emit_layernorm
+
+    def recording(blob, name, x_q, x_ref, *args, **kw):
+        out = plain(blob, name, x_q, x_ref, *args, **kw)
+        if name in dump:
+            for tag, ref, q in (("in", x_ref, x_q), ("out", args[-1], out[0])):
+                side["dumps"].append({"name": f"{name}/{tag}", "ref": ref,
+                                      "shape": list(q.shape), "emu": q})
+        return out
+    emit_layernorm = recording
+    try:
+        for i in range(cfg.depth):
+            x_q, x_ref, s_x, x_f = build_block(blob, sd, T, 0, blk=i, x_f=x_f, x_ref=x_ref,
+                                               s_x=s_x, x_q=x_q, check=check)
+            if i in taps:
+                j = len(side["taps"])
+                t_ref = blob.scratch(T * E)
+                t_q, s_t, _ = emit_layernorm(blob, f"tap{j}.norm", x_q, x_ref, s_x, x_f,
+                                             f64("norm.weight"), f64("norm.bias"), t_ref, check=check)
+                side["taps"].append({"name": f"tap{j}/norm", "block": i, "ref": t_ref,
+                                     "scale": float(s_t), "shape": [1, T, E], "emu": t_q})
+    finally:
+        emit_layernorm = plain
+    return side
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="write a tiny-tpu program blob")
     ap.add_argument("-o", type=Path, required=True)
     ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--tokens", type=int, default=82, help="82 = 126x126 input")
     ap.add_argument("--seed", type=int, default=20260917)
-    ap.add_argument("--program", choices=("gemm-probe", "block"), default="block")
+    ap.add_argument("--program", choices=("gemm-probe", "block", "encoder"), default="encoder")
+    ap.add_argument("--image", type=Path, default=None, help="encoder: the picture")
+    ap.add_argument("--size", type=int, default=126, help="encoder: input side, a multiple of 14")
     ap.add_argument("--no-check", action="store_true", help="no expected results in the blob")
+    ap.add_argument("--dump", action="append", default=[], metavar="OP",
+                    help="encoder: also read back this layernorm's input and output, e.g. blk0.norm1")
     a = ap.parse_args()
 
     from .frontend.dav2 import load_state_dict
@@ -685,7 +783,28 @@ def main() -> None:
         build_gemm_probe(blob, sd, a.tokens, a.seed)
     elif a.program == "block":
         build_block(blob, sd, a.tokens, a.seed, check=not a.no_check)
+    elif a.program == "encoder":
+        from .imageio import load_image, synthetic_image
+        if a.image is not None:
+            image = load_image(a.image, a.size)
+        else:
+            image = synthetic_image(a.size, np.random.default_rng(a.seed))
+        side = build_encoder(blob, sd, image, check=not a.no_check, dump=a.dump)
     total = blob.write(a.o)
+    if a.program == "encoder":
+        # The sidecar: what the host needs to read the taps back and finish
+        # the picture. The emulator's own taps ride along as .npz so the
+        # board's can be compared to them byte for byte.
+        import json
+        emu = {}
+        for t in side["taps"] + side["dumps"]:
+            t["addr"] = blob.address(t.pop("ref"))
+            t["bytes"] = int(np.prod(t["shape"]))
+            emu[t["name"]] = t.pop("emu")
+        side["image_path"] = str(a.image) if a.image else None
+        side["seed"] = a.seed
+        a.o.with_suffix(".json").write_text(json.dumps(side, indent=1))
+        np.savez(a.o.with_suffix(".emu.npz"), **emu)
     n_ops = sum(d.op < 0x10 for d in blob.descs)
     print(f"wrote {a.o}: {total} bytes, {n_ops} hardware ops, "
           f"{len(blob.descs)} descriptors")

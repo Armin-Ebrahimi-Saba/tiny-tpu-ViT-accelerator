@@ -139,6 +139,17 @@ Dependencies run one way: `machine` → `numerics` → `ir` → kernels → `exe
 → `lower`/`harness` → `cli`. Nothing below imports anything above it, and only
 `frontend/dav2.py` imports torch.
 
+### `tiling.py`, `export_tpu.py`, `finish_depth.py`
+
+**The path to the board.** `tiling.py` cuts a GEMM to the RTL's buffers. `export_tpu.py`
+lowers the model onto the hardware's six ops and writes a program blob — one descriptor
+per op, every operand pre-laid-out, the emulator's expected bytes beside each — which
+`rvlab/src/sw/project/tpu_runtime.c` interprets from DDR3. `--program encoder --image X`
+builds the whole ViT-S encoder for a picture, plus a `.json` sidecar naming where the four
+taps land and a `.emu.npz` of the emulator's own taps. `finish_depth.py` reads the taps
+back (`--fpga`: the ones `load_model.py` dumped from the board), runs the DPT head in fp32
+via `run_float(..., overrides=)`, and writes the depth PNG beside the fp32 reference.
+
 ### `machine.py` + `machines/tpu_v2.json`
 
 **What the hardware is allowed to do.** `MachineSpec.load("tpu-v2")` reads the JSON;

@@ -1340,7 +1340,83 @@ slot offsets and cannot hold a 21×384 layernorm or an 82×96 softmax; the kerne
 `tb_layernorm_int` now runs at 384 in the sweep, and the sequencer at those shapes was
 proven on the board instead.
 
-### 6.19 Remaining
+### 6.19 Step 17 — the encoder on the board, and the first depth maps
+
+The whole ViT-S encoder now runs on the FPGA from one blob: patch embedding, the
+position add, twelve blocks, and the final norm at the four DPT taps. 4,759 hardware ops
+and 31.8 MB per image at 126×126 (82 tokens). The host finishes the picture by reading
+the four tap tensors out of DDR3 over the debug port and running the DPT head in fp32
+(`sw/finish_depth.py`, via `run_float(..., overrides=)`).
+
+Two lowering choices that keep the encoder on the existing six ops:
+
+- **Patch embedding is a GEMM.** The host does the im2col: each 14×14×3 patch becomes a
+  row of 588 pixels, padded to 592. Row 0 is all zeros, so the GEMM gives the cls slot
+  its bias alone.
+- **cls token and position embedding are one qadd.** The constant added is `pos` for
+  every patch row and `cls + pos[0] − bias` for row 0, which writes the cls token and
+  its position in one op. DINOv2's bicubic resampling of the position grid for a
+  non-518 input is done in float at export.
+
+**The bug the board found was in the exporter.** The first run failed at block 0's
+first layernorm on all four row chunks, 30–40% of elements off by 1–2 LSB. The same op
+had passed on synthetic input (§6.18). Reading norm1's input back from DDR3 *in the
+run's own OpenOCD session* settled it. That input differed from the emulator's by ±1
+in a third of the bytes, scattered rather than in whole words, and the `tokens` op that
+produced it had passed its own check. So the hardware was right and the expectation was
+wrong: `build_block`, when chained, re-quantized the previous stage's **float** tensor
+instead of taking the **integer** tensor the previous op produced. Increment 2 never hit
+this because its input came from the blob. Each block now takes `x_q` from its producer.
+
+Reading DDR3 after the run does not work. A fresh OpenOCD attach runs `init_reset`,
+DDR3 goes back into reset, and what comes back is garbage. `load_model.py` therefore
+dumps every tensor the blob's sidecar names (taps, plus `--dump` debug tensors) before
+it lets go of the session.
+
+On the board, for each image:
+
+```
+tinytpu: PASS blob -- 4759 ops, 0 failed
+tinytpu: cycles: dma 113058069 (59116064 bytes), config 6144479, engine 67809907, result copy 32015794; verify 234875491
+tap0/norm: board == emulator   (and tap1..tap3)
+```
+
+| image | Pearson vs fp32 | AbsRel* | δ<1.25* |
+|---|---|---|---|
+| demo01, street | 0.955 | 17.9% | 84.9% |
+| demo02, sunflowers | 0.966 | 9.2% | 93.0% |
+| demo05, line drawing | 0.916 | 0.9% | 100% |
+
+\*After a least-squares scale and shift: DA-V2 predicts relative disparity, and pixels
+under 5% of the reference maximum (sky) are excluded. demo05's near-perfect ratio
+metrics come from an almost flat scene; its Pearson is the meaningful number.
+
+![input, fp32 reference, FPGA](assets/results/fpga_depth_126.png)
+
+The maps are recognisably the scenes (sky far, road and cars near, the tower and the
+sunflowers picked out) and softer than fp32. That softness is the int8-everything
+quantization measured in §2, not the board: the board matches the emulator bit for bit.
+The fourth image, demo08, did not run. The FPGA lost its configuration twice within
+minutes (`bad id 0xaffe` after a successful program), and Vivado's `hw_server` kept the
+cable claimed once (`LIBUSB_ERROR_BUSY`). That is the board's power and the tooling, not
+the accelerator, and it is recorded in `CLAUDE.md`.
+
+**Cost:** 219 M cycles per image, **4.4 s at 50 MHz** for the encoder (verification
+excluded), against §6.18's 0.36 s × 12 estimate:
+
+| | cycles | share |
+|---|---|---|
+| DMA | 113.1 M | 52% |
+| engine | 67.8 M | 31% |
+| result copy (CPU) | 32.0 M | 15% |
+| config | 6.1 M | 3% |
+
+The JTAG load of the 31.8 MB blob takes about 110 s and dominates wall time. 25 MB of
+that is the same weights for every image, and expected results are in the blob as well.
+Separating weights from the per-image part is the obvious next step for running many
+images.
+
+### 6.20 Remaining
 
 Only `verible-verilog-lint` is still missing, which makes `srcs.lint` unavailable. It is
 optional — a code-quality check, not a build step — so it is not blocking.
@@ -1352,11 +1428,14 @@ optional — a code-quality check, not a build step — so it is not blocking.
    traffic that is already comfortably underneath it. 32×32 takes compute to 0.91 s.
    DSP-mapped PEs come first — §6.13 leaves 51% of the LUTs free, which 1024 LUT-mapped
    MACs would not fit into, and 88% of the DSPs are idle.
-2. **The runtime**, continued from §6.18. Next the encoder: patch embedding as a GEMM
-   over a host-side im2col, the position add, twelve blocks chained through the arena,
-   the four taps copied out — with the DPT head on the CPU in float, which is the first
-   depth image beside PyTorch's. Then the head on the accelerator, and 518×518.
-3. **Throughput**, which §6.12 measured and §6.14 demoted: the engine's 44%, the DMA's
+2. **The runtime**, continued from §6.19. The encoder runs and depth maps come out.
+   Next: split the blob into a resident weight image and a small per-image part (input,
+   arena, no expected results), so an image costs seconds rather than a 110 s load; then
+   the DPT head on the accelerator (60% of the MACs: convs as GEMMs over im2col), and
+   larger inputs.
+3. **The result path.** 15% of the encoder is the CPU copying results out of the
+   result region. The DMA writing back to DRAM removes it.
+4. **Throughput**, which §6.12 measured and §6.14 demoted: the engine's 44%, the DMA's
    29%, the config writes' 27%. These bind only once the array is faster than the bus,
    which is to say after item 1.
 

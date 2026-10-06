@@ -58,7 +58,17 @@ fails silently leaves the board running the course's `test_rvlab` from the
 bitstream's BRAM init, which passes 4/4 and looks like a run. Loading the
 ELF resets the SoC, so DDR3 is back in reset until the program releases it.
 `tinytpu: bad id 0x0000affe` means the FPGA lost its configuration (power
-cycle): `flow rvlab_fpga_top program` again.
+cycle): `flow rvlab_fpga_top program` again. It can happen mid-run, and then
+looks like a JTAG `read_memory: failed to read memory`.
+
+After `flow rvlab_fpga_top program`, Vivado's `hw_server` can keep the FTDI
+claimed and OpenOCD fails with `LIBUSB_ERROR_BUSY`; `pgrep -af "[h]w_server"`
+and stop it (and its `cs_server`s) before running the scripts.
+
+DDR3 does not survive an OpenOCD attach (`fpga.cfg` resets the SoC). Tensors
+from a run must be read in the run's own session: name them in the blob's
+`.json` sidecar (`python -m sw.export_tpu ... --dump blk0.norm1`) and
+`load_model.py` dumps them after the verdict.
 
 A finished target is not rebuilt when its sources change. Force it with
 `flow rvlab_fpga_top <task> --clean` for each of bitstream, pnr, syn, then

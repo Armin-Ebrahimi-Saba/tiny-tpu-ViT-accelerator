@@ -178,3 +178,13 @@ def test_too_large_for_the_buffers_is_refused():
     x_q, w_q, bias_q, rq = small_gemm(m=8, k=16 * (BUFFERS.wgt_words + 16), n=16)
     with pytest.raises(ValueError):
         emit_gemm(blob, "huge", x_q, None, w_q, bias_q, rq)
+
+
+def test_blob_address_names_arena_tensors_after_write(tmp_path):
+    blob = Blob()
+    blob.data(np.zeros(40, dtype=np.int8))
+    a, b = blob.scratch(100), blob.scratch(16)
+    total = blob.write(tmp_path / "b.bin")
+    assert blob.address(a) == TPU_BLOB_ADDR + total
+    assert blob.address(b) == TPU_BLOB_ADDR + total + 112        # 100 rounded up to 16
+    assert blob.address((b, 4)) == blob.address(b) + 4

@@ -79,9 +79,16 @@ def _structural(op: Op, args: list[np.ndarray]) -> np.ndarray | None:
 
 def run_float(graph: Graph, inputs: dict[str, np.ndarray], *,
               observer: Observer | None = None,
-              keep: Iterable[str] = ()) -> dict[str, np.ndarray]:
-    """Execute in fp32. Returns the graph outputs plus anything named in ``keep``."""
+              keep: Iterable[str] = (),
+              overrides: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
+    """Execute in fp32. Returns the graph outputs plus anything named in ``keep``.
+
+    ``overrides`` substitutes values for named intermediate tensors: the op
+    that would produce one is skipped. This is how a tensor computed elsewhere
+    -- on the board -- is fed to the rest of the graph.
+    """
     keep = list(keep)
+    overrides = dict(overrides or {})
     vals = _Values(graph, pinned=keep)
     for name, arr in graph.initializers.items():
         vals[name] = arr
@@ -94,9 +101,12 @@ def run_float(graph: Graph, inputs: dict[str, np.ndarray], *,
 
     for op in graph.ops:
         args = vals.take(op)
-        out = _structural(op, args)
-        if out is None:
-            out = _float_op(op, args)
+        if op.outputs[0] in overrides:
+            out = np.asarray(overrides[op.outputs[0]], dtype=np.float32)
+        else:
+            out = _structural(op, args)
+            if out is None:
+                out = _float_op(op, args)
         vals[op.outputs[0]] = out
         if observer:
             observer(op.outputs[0], out)
