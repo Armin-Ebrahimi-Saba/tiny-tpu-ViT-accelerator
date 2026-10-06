@@ -33,6 +33,7 @@ With no arguments it lists every target and its status.
 
     # 1. module testbenches, seconds (from the repo root)
     test/v2/run.sh
+    test/soc/run.sh          # the SoC-side DMA (copy, gather, write-back) vs a TL-UL memory
 
     # 2. whole SoC, no DDR3 -- ~12 minutes; the end-to-end check
     flow systb_project sim_rtl_xsim_batch
