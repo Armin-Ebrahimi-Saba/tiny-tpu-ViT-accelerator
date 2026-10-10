@@ -46,6 +46,8 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=Path("."))
     ap.add_argument("--timeout", type=float, default=900.0, help="per run, seconds")
     ap.add_argument("--skip-board", action="store_true", help="reuse taps already on disk")
+    ap.add_argument("--cpu-paths", action="store_true",
+                    help="the CPU gathers and copies results, not the DMA (for comparison)")
     a = ap.parse_args()
 
     side = json.loads(a.program.with_suffix(".json").read_text())
@@ -66,7 +68,8 @@ def main() -> int:
     if not a.skip_board:
         cmd = [sys.executable, "-u", "src/sw/project/tools/load_model.py", "--blob",
                str(a.program.resolve()), "--log", str((a.out / "openocd.log").resolve()),
-               "--timeout", str(a.timeout), "--inputs", *[str(p.resolve()) for p in inputs]]
+               "--timeout", str(a.timeout), *(["--cpu-paths"] if a.cpu_paths else []),
+               "--inputs", *[str(p.resolve()) for p in inputs]]
         rc = subprocess.call(cmd, cwd=RVLAB)
         if rc != 0:
             print(f"board run failed (load_model.py exit {rc})")
