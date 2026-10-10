@@ -9,7 +9,7 @@ build="$here/build"
 mkdir -p "$build"
 verilator --binary -j 0 --quiet -Wall -Wno-fatal \
     -Wno-BLKSEQ -Wno-INITIALDLY -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-DECLFILENAME \
-    --timing -I"$rv/inc" --Mdir "$build/tb_tinytpu_dma" -o tb_tinytpu_dma \
+    --timing --timescale 1ns/1ps -Wno-SYMRSVDWORD -I"$rv/inc" --Mdir "$build/tb_tinytpu_dma" -o tb_tinytpu_dma \
     --top-module tb_tinytpu_dma \
     "$rv/inc/prim_assert.sv" "$rv/rvlab_fpga/pkg/top_pkg.sv" "$rv/tlul/pkg/tlul_pkg.sv" \
     "$rv/rv_dm/tlul_adapter_host.sv" "$rv/student/tinytpu_wdma.sv" \

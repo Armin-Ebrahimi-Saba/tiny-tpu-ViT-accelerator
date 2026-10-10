@@ -1,5 +1,3 @@
-`timescale 1ns/1ps
-
 // ABOUTME: Drives rvlab's tinytpu_wdma against a TL-UL memory with random response delays.
 // ABOUTME: Checks copy, im2col gather and strided write-back against straightforward reference loops.
 
@@ -56,10 +54,10 @@ module tb_tinytpu_dma;
   logic [1:0]    wr_region_seen;
   always_ff @(posedge clk) begin
     if (wr_en) begin
-      buf_mem[wr_addr] <= wr_data;
+      buf_mem[$clog2(BUFW)'(wr_addr)] <= wr_data;
       wr_region_seen   <= wr_region;
     end
-    rd_data <= out_mem[rd_addr];
+    rd_data <= out_mem[$clog2(BUFW)'(rd_addr)];
   end
 
   // ---------------------------------------------------- TL-UL memory model
@@ -183,7 +181,7 @@ module tb_tinytpu_dma;
 
   initial begin
     for (int i = 0; i < MEM_BYTES; i++) mem[i] = 8'(rnd());
-    for (int i = 0; i < BUFW; i++) out_mem[i] = {rnd(), rnd(), rnd(), rnd(), rnd(), rnd(), rnd(), rnd()};
+    for (int i = 0; i < BUFW; i++) out_mem[i] = {16'(rnd()), 16'(rnd()), 16'(rnd()), 16'(rnd()), 16'(rnd()), 16'(rnd()), 16'(rnd()), 16'(rnd())};
     clear_desc();
     repeat (4) @(posedge clk);
     rst_n = 1'b1;
@@ -232,7 +230,7 @@ module tb_tinytpu_dma;
           for (int b = 0; b < 16; b++) touched[at + b] = 1;
         end
       for (int a = 0; a < MEM_BYTES; a++)
-        if (!touched.exists(a) && mem[a] !== mem_before[a]) begin
+        if (touched.exists(a) == 0 && mem[a] !== mem_before[a]) begin
           if (errors < 5) $display("FAIL wb wrote outside its rows at %h", a);
           errors++;
         end
